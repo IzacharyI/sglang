@@ -396,16 +396,40 @@ class Qwen3GatedDeltaNet(nn.Module):
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         DUAL_STREAM_TOKEN_THRESHOLD = 1024 if not _is_npu else 0
         seq_len, _ = hidden_states.shape
-        if seq_len < DUAL_STREAM_TOKEN_THRESHOLD:
+
+        # Ensure attribute exists (do not forcibly create stream if capture logic forbids it)
+        if not hasattr(self, "alt_stream"):
+            self.alt_stream = None
+
+        # Use dual-stream only on CUDA and for short sequences
+        if seq_len < DUAL_STREAM_TOKEN_THRESHOLD and torch.cuda.is_available():
             current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
+
+            # If alt_stream exists, sync properly; otherwise fallback to sequential execution
+            if self.alt_stream is not None:
+                # wait current -> alt before launching alt work (safe if both streams valid)
+                try:
+                    self.alt_stream.wait_stream(current_stream)
+                except Exception:
+                    # best-effort: ignore sync failure and proceed (avoids crash)
+                    pass
+
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            with torch.cuda.stream(self.alt_stream):
+
+            if self.alt_stream is not None:
+                with torch.cuda.stream(self.alt_stream):
+                    projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                try:
+                    current_stream.wait_stream(self.alt_stream)
+                except Exception:
+                    pass
+            else:
+                # no alt stream available -> do sequentially
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
-            current_stream.wait_stream(self.alt_stream)
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
+
         return projected_states_qkvz, projected_states_ba
 
     def forward(

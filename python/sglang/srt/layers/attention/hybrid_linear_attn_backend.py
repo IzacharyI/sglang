@@ -2,6 +2,10 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_recurrent import (
@@ -14,6 +18,9 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from sglang.srt.layers.attention.mamba.causal_conv1d_split_qkv import (
+    causal_conv1d_update_split_qkv,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -261,25 +268,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            conv_weights,
-            bias,
-            activation,
-            conv_state_indices=cache_indices,
-        )
-
-        query, key, value = torch.split(
-            mixed_qkv,
-            [
-                key_dim // attn_tp_size,
-                key_dim // attn_tp_size,
-                value_dim // attn_tp_size,
-            ],
-            dim=-1,
-        )
-        # Reshape from [l, h*d] to [1, l, h, d]
+        if _is_hip:
+            query, key, value = causal_conv1d_update_split_qkv(
+                mixed_qkv,
+                conv_states,
+                conv_weights,
+                key_dim=key_dim // attn_tp_size,
+                value_dim=value_dim // attn_tp_size,
+                bias=bias,
+                activation=activation,
+                conv_state_indices=cache_indices,
+            )
+        else:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                conv_weights,
+                bias,
+                activation,
+                conv_state_indices=cache_indices,
+            )
+            query, key, value = torch.split(
+                mixed_qkv,
+                [
+                    key_dim // attn_tp_size,
+                    key_dim // attn_tp_size,
+                    value_dim // attn_tp_size,
+                ],
+                dim=-1,
+            )
+        
         seq_len = query.shape[0]
         num_heads = query.shape[1] // head_k_dim
         query = query.view(1, seq_len, num_heads, head_k_dim)
@@ -401,6 +419,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query = query.view(1, actual_seq_len, num_heads, head_k_dim)
         key = key.view(1, actual_seq_len, num_heads, head_k_dim)
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
+
+        # # Ensure tensors are contiguous for Triton kernels
+        # # Only copy if not already contiguous to avoid unnecessary copies
+        # if not query.is_contiguous():
+        #     query = query.contiguous()
+        # if not key.is_contiguous():
+        #     key = key.contiguous()
+        # if not value.is_contiguous():
+        #     value = value.contiguous()
 
         beta = b.sigmoid()
         g = fused_gdn_gating(A_log, a, dt_bias)

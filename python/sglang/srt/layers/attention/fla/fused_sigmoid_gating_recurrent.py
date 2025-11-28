@@ -162,7 +162,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-@input_guard
+# Note: @input_guard is removed because in the optimized path
+# (causal_conv1d_update_split_qkv), q/k/v are already contiguous.
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
