@@ -8,6 +8,9 @@ _is_hip = is_hip()
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.srt.layers.attention.fla.fused_gdn_gating_prefill import (
+    fused_gdn_gating_and_sigmoid,
+)
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
@@ -429,8 +432,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # if not value.is_contiguous():
         #     value = value.contiguous()
 
-        beta = b.sigmoid()
-        g = fused_gdn_gating(A_log, a, dt_bias)
+        if _is_hip:
+            g, beta = fused_gdn_gating_and_sigmoid(A_log, a, b, dt_bias)
+        else:
+            beta = b.sigmoid()
+            g = fused_gdn_gating(A_log, a, dt_bias)
 
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
