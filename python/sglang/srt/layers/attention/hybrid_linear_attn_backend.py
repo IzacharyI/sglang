@@ -64,6 +64,18 @@ if not is_cpu() and not is_npu():
         # CuTe DSL path requires cuda-python (cuda.bindings.*). Keep runtime usable
         # by falling back to non-CuTe kernels when it's unavailable.
         cutedsl_fused_sigmoid_gating_delta_rule_update = None
+    try:
+        from sglang.jit_kernel.flydsl_gdn import (
+            _is_flydsl_available,
+            flydsl_fused_sigmoid_gating_delta_rule_update,
+            flydsl_pool_transpose_inplace,
+            warmup_flydsl_gdr,
+        )
+    except (ImportError, ModuleNotFoundError):
+        _is_flydsl_available = lambda: False
+        flydsl_fused_sigmoid_gating_delta_rule_update = None
+        flydsl_pool_transpose_inplace = None
+        warmup_flydsl_gdr = None
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
@@ -860,12 +872,157 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 "(missing cuda.bindings). Falling back to FLA decode kernel."
             )
             use_cutedsl = False
-        rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
-        self._kernel_func = (
-            cutedsl_fused_sigmoid_gating_delta_rule_update
-            if use_cutedsl
-            else fused_sigmoid_gating_delta_rule_update
+
+        self._full_temporal_pool = None
+        self._states_in_kv = False
+        self._kv_restore_slots = None
+        self._pool_has_vk_data = False
+
+        use_flydsl = (
+            _is_hip
+            and flydsl_fused_sigmoid_gating_delta_rule_update is not None
+            and _is_flydsl_available()
         )
+
+        if use_flydsl:
+            self._kernel_func = flydsl_fused_sigmoid_gating_delta_rule_update
+            self._full_temporal_pool = (
+                model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal
+            )
+            hf_cfg = model_runner.model_config.hf_config.get_text_config()
+            tp = model_runner.tp_size
+            warmup_flydsl_gdr(
+                dtype=model_runner.dtype,
+                num_k_heads=hf_cfg.linear_num_key_heads // tp,
+                num_v_heads=hf_cfg.linear_num_value_heads // tp,
+                head_k_dim=hf_cfg.linear_key_head_dim,
+                head_v_dim=hf_cfg.linear_value_head_dim,
+            )
+            rank0_log("FlyDSL GDN decode enabled (VK pool, Triton batch transpose)")
+        elif use_cutedsl:
+            rank0_log("CuTe DSL GDN decode enabled")
+            self._kernel_func = cutedsl_fused_sigmoid_gating_delta_rule_update
+        else:
+            rank0_log("FLA Triton GDN decode enabled (default)")
+            self._kernel_func = fused_sigmoid_gating_delta_rule_update
+
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        will_extend = (
+            forward_batch.forward_mode.is_extend()
+            and self._full_temporal_pool is not None
+        )
+
+        if self._states_in_kv and not will_extend:
+            self._batch_restore_vk()
+
+        super().init_forward_metadata(forward_batch)
+
+        if will_extend:
+            if self._states_in_kv:
+                self._merged_restore_and_extend(forward_batch)
+            else:
+                self._batch_transpose_for_extend(forward_batch)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        if self._states_in_kv:
+            self._batch_restore_vk()
+        super().init_forward_metadata_replay_cuda_graph(
+            bs, req_pool_indices, seq_lens, seq_lens_sum,
+            encoder_lens, forward_mode, spec_info, seq_lens_cpu,
+        )
+        if forward_mode.is_target_verify() and self._full_temporal_pool is not None:
+            cache_indices = self.forward_metadata.mamba_cache_indices
+            flydsl_pool_transpose_inplace(self._full_temporal_pool, cache_indices)
+            self._kv_restore_slots = cache_indices
+            self._states_in_kv = True
+
+    def _collect_kv_restore_slots(self, forward_batch, cache_indices, fm):
+        """Collect slots needing KV→VK restore after extend."""
+        restore_slots = [cache_indices]
+        if (
+            forward_batch.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask.any()
+        ):
+            if fm.track_ssm_h_dst is not None and fm.track_ssm_h_dst.numel() > 0:
+                restore_slots.append(fm.track_ssm_h_dst)
+            if fm.track_ssm_final_dst is not None and fm.track_ssm_final_dst.numel() > 0:
+                restore_slots.append(fm.track_ssm_final_dst)
+        if len(restore_slots) == 1:
+            self._kv_restore_slots = cache_indices
+        else:
+            self._kv_restore_slots = torch.cat(restore_slots).unique()
+
+    def _batch_transpose_for_extend(self, forward_batch: ForwardBatch):
+        """VK→KV for extend. Skip zero slots (prefix_lens == 0)."""
+        fm = self.forward_metadata
+        cache_indices = fm.mamba_cache_indices
+
+        if self._pool_has_vk_data:
+            has_vk = forward_batch.extend_prefix_lens > 0
+            if has_vk.any():
+                flydsl_pool_transpose_inplace(
+                    self._full_temporal_pool, cache_indices[has_vk]
+                )
+
+        self._collect_kv_restore_slots(forward_batch, cache_indices, fm)
+        self._states_in_kv = True
+
+    def _merged_restore_and_extend(self, forward_batch: ForwardBatch):
+        """Merge restore and extend: only transpose the symmetric difference."""
+        fm = self.forward_metadata
+        cache_indices = fm.mamba_cache_indices
+        prev_slots = self._kv_restore_slots
+
+        restore_mask = ~torch.isin(prev_slots, cache_indices)
+        restore_only = prev_slots[restore_mask]
+
+        new_mask = ~torch.isin(cache_indices, prev_slots)
+        new_to_kv = cache_indices[new_mask]
+
+        parts = []
+        if restore_only.numel() > 0:
+            parts.append(restore_only)
+        if self._pool_has_vk_data and new_to_kv.numel() > 0:
+            has_vk = forward_batch.extend_prefix_lens[new_mask] > 0
+            if has_vk.any():
+                parts.append(new_to_kv[has_vk])
+
+        if parts:
+            to_transpose = torch.cat(parts) if len(parts) > 1 else parts[0]
+            flydsl_pool_transpose_inplace(self._full_temporal_pool, to_transpose)
+
+        if restore_only.numel() > 0:
+            self._pool_has_vk_data = True
+
+        self._collect_kv_restore_slots(forward_batch, cache_indices, fm)
+        self._states_in_kv = True
+
+    def _batch_restore_vk(self):
+        """KV→VK restore for all layers."""
+        flydsl_pool_transpose_inplace(
+            self._full_temporal_pool, self._kv_restore_slots,
+        )
+        self._kv_restore_slots = None
+        self._states_in_kv = False
+        self._pool_has_vk_data = True
+
+    def extend_kv_restore_slots(self, extra_slots: torch.Tensor):
+        """Add extra slots (e.g. EAGLE track slots) to KV restore set."""
+        if self._kv_restore_slots is not None and extra_slots.numel() > 0:
+            self._kv_restore_slots = torch.cat(
+                [self._kv_restore_slots, extra_slots]
+            ).unique()
 
     def forward_decode(
         self,
@@ -1801,3 +1958,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
                 :, src_track_indices, track_steps
             ].to(conv_states.dtype, copy=False)
+
+            if hasattr(self.linear_attn_backend, "extend_kv_restore_slots"):
+                self.linear_attn_backend.extend_kv_restore_slots(dst_track_indices)
