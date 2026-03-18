@@ -853,19 +853,32 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
-        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
-        if use_cutedsl and cutedsl_fused_sigmoid_gating_delta_rule_update is None:
-            rank0_log(
-                "CuTe DSL GDN decode requested but unavailable "
-                "(missing cuda.bindings). Falling back to FLA decode kernel."
+        use_hip_gdn = Envs.SGLANG_USE_HIP_GDN_DECODE.get()
+        if use_hip_gdn:
+            try:
+                from aiter.ops.hip.gated_delta_net import (
+                    hip_fused_sigmoid_gating_delta_rule_update,
+                )
+                self._kernel_func = hip_fused_sigmoid_gating_delta_rule_update
+                rank0_log("HIP TUNED GDN decode enabled")
+            except Exception as e:
+                rank0_log(f"HIP GDN decode requested but failed to load: {e}. Falling back.")
+                use_hip_gdn = False
+
+        if not use_hip_gdn:
+            use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
+            if use_cutedsl and cutedsl_fused_sigmoid_gating_delta_rule_update is None:
+                rank0_log(
+                    "CuTe DSL GDN decode requested but unavailable "
+                    "(missing cuda.bindings). Falling back to FLA decode kernel."
+                )
+                use_cutedsl = False
+            rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
+            self._kernel_func = (
+                cutedsl_fused_sigmoid_gating_delta_rule_update
+                if use_cutedsl
+                else fused_sigmoid_gating_delta_rule_update
             )
-            use_cutedsl = False
-        rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
-        self._kernel_func = (
-            cutedsl_fused_sigmoid_gating_delta_rule_update
-            if use_cutedsl
-            else fused_sigmoid_gating_delta_rule_update
-        )
 
     def forward_decode(
         self,

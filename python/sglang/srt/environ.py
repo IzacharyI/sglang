@@ -188,6 +188,9 @@ class Envs:
     # CuTe DSL GDN Decode
     SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
 
+    # HIP TUNED GDN Decode (ROCm only)
+    SGLANG_USE_HIP_GDN_DECODE = EnvBool(False)
+
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
