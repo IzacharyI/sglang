@@ -853,16 +853,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
-        use_hip_gdn = Envs.SGLANG_USE_HIP_GDN_DECODE.get()
+        self._state_transpose_fn = None
+        self._full_temporal = None
+
+        use_hip_gdn = _is_hip and Envs.SGLANG_USE_HIP_GDN_DECODE.get()
         if use_hip_gdn:
             try:
                 from aiter.ops.hip.gated_delta_net import (
                     hip_fused_sigmoid_gating_delta_rule_update,
+                    hip_state_transpose_inplace,
                 )
                 self._kernel_func = hip_fused_sigmoid_gating_delta_rule_update
-                rank0_log("HIP TUNED GDN decode enabled")
+                self._state_transpose_fn = hip_state_transpose_inplace
+                mamba_map = model_runner.req_to_token_pool.mamba_map
+                self._gdn_layer_ids = sorted(mamba_map.keys())
+                self._full_temporal = (
+                    model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal
+                )
+                self._pool_stride = self._full_temporal.shape[1]
+                self._num_gdn_layers = self._full_temporal.shape[0]
+                rank0_log("HIP GDN decode enabled (VK state, no decode transpose)")
             except Exception as e:
-                rank0_log(f"HIP GDN decode requested but failed to load: {e}. Falling back.")
+                rank0_log(
+                    f"HIP GDN decode requested but failed to load: {e}. "
+                    "Falling back."
+                )
                 use_hip_gdn = False
 
         if not use_hip_gdn:
@@ -1070,6 +1085,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
+        # HIP VK: on first GDN layer, batch-transpose ALL layers [V,K]→[K,V]
+        if self._state_transpose_fn is not None:
+            if layer.layer_id == self._gdn_layer_ids[0]:
+                self._transpose_all_layers(
+                    cache_indices, layer.num_v_heads,
+                )
+
         if is_target_verify:
             core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
@@ -1087,6 +1109,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )
+            # verify: state not updated; on last layer transpose ALL back
+            if self._state_transpose_fn is not None:
+                if layer.layer_id == self._gdn_layer_ids[-1]:
+                    self._transpose_all_layers(
+                        cache_indices, layer.num_v_heads,
+                    )
         else:
             # Only cuda env uses fuse ssm_states update
             recurrent_state = ssm_states
@@ -1116,7 +1144,75 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 forward_batch, h, ssm_states, forward_metadata
             )
 
+            # On last GDN layer: batch-transpose ALL layers back [K,V]→[V,K]
+            if self._state_transpose_fn is not None:
+                if layer.layer_id == self._gdn_layer_ids[-1]:
+                    self._transpose_all_layers_extend(
+                        cache_indices, forward_batch,
+                        forward_metadata, layer.num_v_heads,
+                    )
+
         return core_attn_out
+
+    def _expand_indices_all_layers(
+        self, slot_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expand per-slot indices to cover ALL mamba layers.
+
+        The full temporal tensor is [num_layers, pool_stride, HV, 128, 128].
+        Flattening the first two dims gives [num_layers * pool_stride, HV, 128, 128].
+        For slot index `i` at layer `l`, the flattened index is `l * pool_stride + i`.
+        """
+        offsets = torch.arange(
+            0,
+            self._num_gdn_layers * self._pool_stride,
+            self._pool_stride,
+            device=slot_indices.device,
+            dtype=torch.int32,
+        )
+        return (
+            slot_indices.to(torch.int32).unsqueeze(0) + offsets.unsqueeze(1)
+        ).reshape(-1)
+
+    def _transpose_all_layers(
+        self, cache_indices: torch.Tensor, num_v_heads: int,
+    ):
+        """Single kernel launch: transpose cache_indices slots across ALL layers."""
+        expanded = self._expand_indices_all_layers(cache_indices)
+        flat_state = self._full_temporal.view(-1, *self._full_temporal.shape[2:])
+        self._state_transpose_fn(
+            flat_state, expanded, expanded.shape[0], num_v_heads,
+        )
+
+    def _transpose_all_layers_extend(
+        self,
+        cache_indices: torch.Tensor,
+        forward_batch: ForwardBatch,
+        forward_metadata: ForwardMetadata,
+        num_v_heads: int,
+    ):
+        """Single kernel launch: transpose all modified slots across ALL layers.
+
+        Includes cache_indices plus any prefix-cache tracking destinations.
+        """
+        slots = [cache_indices]
+        if (
+            forward_batch.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask.any()
+        ):
+            if forward_metadata.track_ssm_h_dst.numel() > 0:
+                slots.append(forward_metadata.track_ssm_h_dst)
+            if forward_metadata.track_ssm_final_dst.numel() > 0:
+                slots.append(forward_metadata.track_ssm_final_dst)
+        if len(slots) == 1:
+            unique_slots = cache_indices
+        else:
+            unique_slots = torch.cat(slots).unique()
+        expanded = self._expand_indices_all_layers(unique_slots)
+        flat_state = self._full_temporal.view(-1, *self._full_temporal.shape[2:])
+        self._state_transpose_fn(
+            flat_state, expanded, expanded.shape[0], num_v_heads,
+        )
 
 
 class Mamba2AttnBackend(MambaAttnBackendBase):
