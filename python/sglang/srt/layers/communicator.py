@@ -25,6 +25,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_fused_allreduce_rmsnorm,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -86,6 +87,36 @@ elif _is_npu:
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
 # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+
+
+# Old-CA AR + add + RMSNorm fusion gate. Only opt-in when the rest of the
+# model is using old-CA (SGLANG_USE_AITER_NEW_CA=false), otherwise the
+# fused kernel's AR half would mismatch the surrounding new-CA dispatch.
+_AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
+_AITER_FUSED_MLP_QUANT_DEFAULT = (
+    _use_aiter
+    and not _AITER_NEW_CA
+    and not get_bool_env_var("SGLANG_DISABLE_AITER_FUSED_MLP_QUANT", "false")
+)
+# Decode-only by default: prefill is GEMM-bound and AITER's fused kernel
+# falls to a split path for large m, so the win is concentrated on the
+# cuda-graph decode path. Set to ``false`` to also fuse in prefill/extend.
+_AITER_FUSED_AR_RMSNORM_DECODE_ONLY = get_bool_env_var(
+    "SGLANG_FUSED_AR_RMSNORM_DECODE_ONLY", "true"
+)
+
+
+# Legacy ``(bf16, fp8, scale)`` bundle from the previous quant-fused MLP
+# path. The current norm-only fusion returns plain ``torch.Tensor``, so this
+# is only kept for downstream ``isinstance`` checks.
+@dataclass
+class FusedQuantPack:
+    bf16: torch.Tensor
+    fp8: torch.Tensor
+    scale: torch.Tensor
+
+    def as_fp8_tuple(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (self.bf16, self.fp8, self.scale)
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
@@ -551,6 +582,83 @@ class LayerCommunicator:
             context=self._context,
         )
 
+    def prepare_mlp_with_norm_fusion(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        cache=None,
+    ):
+        """``prepare_mlp`` fast path that fuses ``AR + residual_add +
+        RMSNorm`` (no quant) via the AITER old-CA kernel. Returns
+        ``(hidden_states, residual)`` in bf16; falls back to ``prepare_mlp``
+        whenever the gate fails. Quant is left to the downstream FP8 linear.
+        """
+        if cache is not None:
+            self._context.cache = cache
+        if not self._can_fuse_mlp_quant(forward_batch):
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+
+        post_norm = self.post_attention_layernorm
+        weight = getattr(post_norm, "weight", None)
+        eps = getattr(post_norm, "variance_epsilon", None)
+        if weight is None or eps is None or residual is None:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        if not isinstance(weight, torch.Tensor) or weight.dim() != 1:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        if hidden_states.dtype != weight.dtype:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        if hidden_states.shape[0] == 0:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+
+        # Pass weight raw: on HIP/AITER, ``default_weight_loader``
+        # pre-shifts gemma weights by +1 at load time, so ``self.weight``
+        # already matches what ``forward_aiter`` and the fused kernel
+        # multiply with. Adding +1 here would double-shift.
+        result = tensor_model_parallel_fused_allreduce_rmsnorm(
+            hidden_states,
+            residual,
+            weight,
+            eps,
+            use_old_ca=not _AITER_NEW_CA,
+        )
+        if result is None:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        out_bf16, residual_out = result
+        return out_bf16, residual_out
+
+    def _can_fuse_mlp_quant(self, forward_batch: ForwardBatch) -> bool:
+        """Gate ``prepare_mlp_with_norm_fusion``. Requires HIP+AITER+old-CA,
+        TP>1, single-DP-attn, non-scattered input, and the standard
+        ``_gather_hidden_states_and_residual`` comm pattern (the only one
+        whose semantics equal AR + RMSNorm on the full-rank hidden_states).
+        Decode-only by default (see ``SGLANG_FUSED_AR_RMSNORM_DECODE_ONLY``).
+        """
+        if not _AITER_FUSED_MLP_QUANT_DEFAULT:
+            return False
+        if (
+            _AITER_FUSED_AR_RMSNORM_DECODE_ONLY
+            and not forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            return False
+        ctx = self._context
+        if ctx.tp_size <= 1:
+            return False
+        if ctx.attn_dp_size != 1:
+            return False
+        if get_attn_tp_context().input_scattered:
+            return False
+        fn = self._communicate_with_all_reduce_and_layer_norm_fn
+        if not isinstance(fn, partial):
+            return False
+        if (
+            fn.func
+            is not CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
+        ):
+            return False
+        return True
+
     def postprocess_layer(
         self,
         hidden_states: torch.Tensor,
@@ -594,17 +702,28 @@ class LayerCommunicator:
         if get_attn_tp_context().input_scattered:
             return False
 
+        if self.is_last_layer or self._context.tp_size <= 1:
+            return False
+
         batch_size = (
             forward_batch.input_ids.shape[0]
             if hasattr(forward_batch, "input_ids")
             else 0
         )
 
-        return (
-            apply_flashinfer_allreduce_fusion(batch_size)
-            and (not self.is_last_layer)
-            and (self._context.tp_size > 1)
-        )
+        # HIP/AITER/old-CA cross-layer fusion: defer this layer's tail AR
+        # so the next layer's ``input_layernorm.forward_with_allreduce_fusion``
+        # can fold AR + add + RMSNorm into one kernel. Decode-only by default.
+        if _AITER_FUSED_MLP_QUANT_DEFAULT and self._context.attn_dp_size == 1:
+            if (
+                _AITER_FUSED_AR_RMSNORM_DECODE_ONLY
+                and not forward_batch.forward_mode.is_decode_or_idle()
+            ):
+                pass
+            else:
+                return True
+
+        return apply_flashinfer_allreduce_fusion(batch_size)
 
 
 @dataclass

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -598,6 +598,21 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Pre-quantized ``(bf16_view, fp8, per_token_scale)`` from AITER's
+        # fused AR+RMSNorm+per-token-quant: thread ``(fp8, scale)`` through as
+        # ``pre_quantized`` to skip re-quant; ``bf16_view`` keeps dtype/shape.
+        pre_quantized: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        if (
+            isinstance(x, tuple)
+            and len(x) == 3
+            and isinstance(x[0], torch.Tensor)
+            and isinstance(x[1], torch.Tensor)
+            and isinstance(x[2], torch.Tensor)
+        ):
+            bf16_view, fp8_view, scale_view = x
+            pre_quantized = (fp8_view, scale_view)
+            x = bf16_view
+
         if self.use_marlin:
             return apply_fp8_marlin_linear(
                 input=x,
@@ -665,6 +680,7 @@ class Fp8LinearMethod(LinearMethodBase):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+            pre_quantized=pre_quantized,
         )
 
 

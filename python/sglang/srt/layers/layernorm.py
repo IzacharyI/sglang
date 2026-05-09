@@ -48,6 +48,16 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 
+# Cross-layer AR + add + RMSNorm fusion gate. Mirrors the gating in
+# ``sglang.srt.layers.communicator``: only opt in when the rest of the
+# model is using old-CA (SGLANG_USE_AITER_NEW_CA=false).
+_AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
+_AITER_FUSED_NORM_DEFAULT = (
+    _use_aiter
+    and not _AITER_NEW_CA
+    and not get_bool_env_var("SGLANG_DISABLE_AITER_FUSED_MLP_QUANT", "false")
+)
+
 if _is_cuda or _is_xpu:
     if _is_flashinfer_available:
         try:
@@ -309,6 +319,31 @@ class RMSNorm(MultiPlatformOp):
         """
         if residual is not None:
             from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+            if (
+                _AITER_FUSED_NORM_DEFAULT
+                and get_tensor_model_parallel_world_size() > 1
+                and x.shape[0] != 0
+                and isinstance(self.weight, torch.Tensor)
+                and self.weight.dim() == 1
+                and x.dtype == self.weight.dtype
+            ):
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                from sglang.srt.distributed import (
+                    tensor_model_parallel_fused_allreduce_rmsnorm,
+                )
+
+                fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x,
+                    residual,
+                    self.weight,
+                    self.variance_epsilon,
+                    use_old_ca=True,
+                )
+                if fused_result is not None:
+                    return fused_result
+
             from sglang.srt.layers.flashinfer_comm_fusion import (
                 flashinfer_allreduce_residual_rmsnorm,
             )
@@ -506,6 +541,44 @@ class GemmaRMSNorm(MultiPlatformOp):
         x = x * (1.0 + self.weight.float())
         x = x.to(orig_dtype)
         return x if residual is None else (x, residual)
+
+    def forward_with_allreduce_fusion(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Cross-layer fused AR + residual add + Gemma-RMSNorm via the
+        AITER old-CA kernel. Mirrors ``RMSNorm.forward_with_allreduce_fusion``.
+        Pass weight raw: ``default_weight_loader`` pre-shifts gemma weights
+        by +1 on HIP/AITER, so a second +1 here would double-shift.
+        """
+        if residual is not None:
+            from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+            if (
+                _AITER_FUSED_NORM_DEFAULT
+                and get_tensor_model_parallel_world_size() > 1
+                and x.shape[0] != 0
+                and x.dtype == self.weight.dtype
+            ):
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                from sglang.srt.distributed import (
+                    tensor_model_parallel_fused_allreduce_rmsnorm,
+                )
+
+                fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x,
+                    residual,
+                    self.weight,
+                    self.variance_epsilon,
+                    use_old_ca=True,
+                )
+                if fused_result is not None:
+                    return fused_result
+
+        return self.forward(x, residual, post_residual_addition)
 
     def forward_cuda(
         self,
