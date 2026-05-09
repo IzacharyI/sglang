@@ -144,20 +144,30 @@ class Qwen2MoeMLP(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ):
-        gate_up, _ = self.gate_up_proj(x)
+        # Accept the AITER fused-quant pack from
+        # ``LayerCommunicator.prepare_mlp_with_quant_fusion``. Forward the
+        # ``(bf16, fp8, scale)`` triple to ``gate_up_proj`` so that an FP8
+        # ``LinearMethod`` can skip the redundant per-token quant kernel,
+        # then fall back to the bf16 view for any non-FP8 sub-method.
+        from sglang.srt.layers.communicator import FusedQuantPack
+
+        if isinstance(x, FusedQuantPack):
+            gate_up, _ = self.gate_up_proj(x.as_fp8_tuple())
+        else:
+            gate_up, _ = self.gate_up_proj(x)
         if _use_aiter:
-            x = torch.empty(
+            mlp_x = torch.empty(
                 (gate_up.shape[0], gate_up.shape[1] // 2),
                 dtype=gate_up.dtype,
                 device=gate_up.device,
             )
-            self.act_fn(x, gate_up)
+            self.act_fn(mlp_x, gate_up)
         else:
-            x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+            mlp_x = self.act_fn(gate_up)
+        mlp_x, _ = self.down_proj(
+            mlp_x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
-        return x
+        return mlp_x
 
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
@@ -249,14 +259,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         ]
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+    def _forward_shared_experts(self, hidden_states):
+        # ``hidden_states`` may be the AITER FusedQuantPack so the FP8
+        # ``shared_expert.gate_up_proj`` can skip the redundant per-token
+        # quant. The shared_expert_gate is always bf16 (torch.nn.Linear),
+        # so we feed it the bf16 view explicitly.
+        from sglang.srt.layers.communicator import FusedQuantPack
+
+        bf16_view = (
+            hidden_states.bf16
+            if isinstance(hidden_states, FusedQuantPack)
+            else hidden_states
+        )
+
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
-                        hidden_states,
+                        bf16_view,
                         self.shared_expert_gate.weight,
                         self.shared_expert_gate.bias,
                         True,
@@ -264,7 +286,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     )
                 else:
                     shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
+                        F.sigmoid(self.shared_expert_gate(bf16_view))
                         * shared_output
                     )
 
@@ -306,9 +328,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        return self._forward_normal_dual_stream(hidden_states, hidden_states)
+
+    def _forward_normal_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+        shared_expert_input,
+    ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(hidden_states)
+        # ``shared_expert_input`` may be a ``FusedQuantPack`` so that
+        # shared_expert.gate_up_proj can skip the per-token quant kernel.
+        shared_output = self._forward_shared_experts(shared_expert_input)
 
         with torch.cuda.stream(self.alt_stream):
             router_output = self._forward_router_experts(hidden_states)
@@ -323,10 +354,32 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        # Unpack the AITER fused-quant pack from prepare_mlp_with_quant_fusion
+        # if present: gate / experts run on the bf16 view (router weights
+        # and per-expert quants stay unchanged), while shared_expert
+        # receives the original pack so its FP8 ``gate_up_proj`` can skip
+        # the redundant per-token quant. This keeps the fusion path as a
+        # transparent perf optimization with no semantic change.
+        from sglang.srt.layers.communicator import FusedQuantPack
+
+        fused_pack: Optional[FusedQuantPack] = None
+        if isinstance(hidden_states, FusedQuantPack):
+            fused_pack = hidden_states
+            hidden_states = fused_pack.bf16
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        # The pack's fp8 / scale / bf16 are token-aligned with hidden_states
+        # but ``hidden_states.view`` may reshape; only fp8/scale need the
+        # same leading dim as hidden_states post-view, which is already
+        # satisfied because reshape only collapses leading dims (-1).
+        shared_expert_input = (
+            fused_pack if fused_pack is not None else hidden_states
+        )
 
         if get_moe_a2a_backend().is_deepep():
+            # DeepEP path: drop the pack (it duplicates a2a-shaped tensors
+            # we'd have to reshard); shared_expert runs on bf16.
             return self._forward_deepep(hidden_states, forward_batch)
 
         if (
@@ -334,11 +387,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
         ):
-            final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states
+            final_hidden_states, shared_output = self._forward_normal_dual_stream(
+                hidden_states, shared_expert_input
             )
         else:
-            shared_output = self._forward_shared_experts(hidden_states)
+            shared_output = self._forward_shared_experts(shared_expert_input)
             final_hidden_states = self._forward_router_experts(hidden_states)
 
         if shared_output is not None:

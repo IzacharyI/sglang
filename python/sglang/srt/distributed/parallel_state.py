@@ -732,6 +732,90 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
+    def fused_allreduce_rmsnorm_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        *,
+        emit_bf16: bool = False,
+        use_old_ca: bool = False,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Try AITER fused all-reduce + residual add + RMSNorm + per-token FP8
+        quant via the custom all-reduce communicator. ROCm/HIP only.
+
+        Returns ``None`` if no fused path is available so callers can fall
+        back to the unfused (separate AR + RMSNorm + per-token quant) path.
+
+        When ``emit_bf16=False`` returns ``(out_fp8, residual_out, scale)``.
+        When ``emit_bf16=True``  returns ``(out_fp8, residual_out, scale, bf16_view)``.
+
+        The ``bf16_view`` is the post-RMSNorm pre-quantization activation,
+        useful for sparse MoE layers where some sub-modules need the
+        unquantized hidden_states (e.g. router gate, experts that re-quant
+        on their own) while shared-expert / dense MLP can reuse the
+        already-quantized ``(out_fp8, scale)`` tuple to skip a redundant
+        per-token quant before ``gate_up_proj``.
+        """
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_quant"):
+            return None
+        try:
+            should = ca_comm.should_custom_ar(input_)
+        except Exception:
+            should = False
+        if not should:
+            return None
+
+        # 1-stage vs 2-stage selection mirrors the AITER device communicator
+        # default (also matches main's ``fused_allreduce_rmsnorm`` heuristic):
+        # tiny tensors prefer 1-stage to avoid the 2-stage barrier latency.
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            total_bytes = input_.numel() * input_.element_size()
+            use_1stage_ar = total_bytes <= 128 * 1024
+        try:
+            return ca_comm.custom_fused_ar_rms_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+                emit_bf16=emit_bf16,
+                use_old_ca=use_old_ca,
+            )
+        except TypeError:
+            # Older AITER builds may not support ``emit_bf16`` and/or
+            # ``use_old_ca``. Try emit_bf16-only first; if that still raises,
+            # fall back to the bare 5-arg form (only honored when no extra
+            # behavior was requested) so we never crash on a stale aiter.
+            try:
+                if use_old_ca:
+                    # Caller asked for old-CA AR but aiter is too old; fall
+                    # through to caller's non-fused path so we never silently
+                    # run new-CA AR when SGLANG_USE_AITER_NEW_CA=false.
+                    return None
+                return ca_comm.custom_fused_ar_rms_quant(
+                    input_,
+                    residual_inp_,
+                    weight_,
+                    eps,
+                    use_1stage_ar,
+                    emit_bf16=emit_bf16,
+                )
+            except TypeError:
+                if emit_bf16:
+                    return None
+                return ca_comm.custom_fused_ar_rms_quant(
+                    input_, residual_inp_, weight_, eps, use_1stage_ar
+                )
+        except Exception:
+            return None
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:

@@ -25,6 +25,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -86,6 +87,47 @@ elif _is_npu:
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
 # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+
+
+# ``SGLANG_USE_AITER_NEW_CA`` selects the AITER 2-stage "new" custom-allreduce
+# kernel. The fused AR+RMSNorm+per-token-quant path that we ported lives on
+# the *old* CA kernel (use_new=false) and is the only path validated for
+# correctness with PR #2890's barrier fix in this branch. The MLP-fusion
+# helper below is therefore only enabled when callers explicitly opt out of
+# the new CA so we don't accidentally route old-CA fused kernels through the
+# new-CA all_reduce dispatch.
+_AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
+_AITER_FUSED_MLP_QUANT_DEFAULT = (
+    _use_aiter
+    and not _AITER_NEW_CA
+    and not get_bool_env_var("SGLANG_DISABLE_AITER_FUSED_MLP_QUANT", "false")
+)
+
+
+@dataclass
+class FusedQuantPack:
+    """Bundle returned by ``LayerCommunicator.prepare_mlp_with_quant_fusion``.
+
+    Wraps the side-outputs of AITER's fused all-reduce + residual add +
+    RMSNorm + per-token FP8 quant kernel so downstream layers can pick the
+    view they need without re-running the quant. ``bf16`` is the
+    pre-quantization normed activation (the same value the unfused path
+    would have produced); ``fp8`` and ``scale`` are the per-token quantized
+    output and per-token scale that ``Fp8LinearMethod`` would otherwise
+    derive from ``bf16``.
+
+    Treat this as a value type: never mutate fields after construction;
+    callers may share it across siblings (e.g. shared_expert + dense MLP).
+    """
+
+    bf16: torch.Tensor
+    fp8: torch.Tensor
+    scale: torch.Tensor
+
+    def as_fp8_tuple(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """View this pack as the ``(bf16, fp8, scale)`` triple that
+        ``Fp8LinearMethod.apply`` understands as a pre-quantized input."""
+        return (self.bf16, self.fp8, self.scale)
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
@@ -550,6 +592,136 @@ class LayerCommunicator:
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
+
+    def prepare_mlp_with_quant_fusion(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        emit_bf16: bool = False,
+        cache=None,
+    ):
+        """Variant of ``prepare_mlp`` that fuses
+        ``all_reduce + residual_add + RMSNorm + per-token FP8 quant`` into a
+        single AITER kernel when the runtime conditions are met (HIP +
+        SGLANG_USE_AITER=1 + SGLANG_USE_AITER_NEW_CA=false + tp_size > 1 +
+        no DP attn / no scattered input + post-norm has a 1D weight).
+
+        Returns one of:
+        - ``(FusedQuantPack, residual)`` when fusion fired (downstream MLP
+          can call ``pack.as_fp8_tuple()`` on its FP8 ``gate_up_proj`` to
+          skip the redundant per-token quant).
+        - ``(hidden_states, residual)`` (BF16, identical shape/dtype to the
+          unfused path) when fusion did not fire — caller can transparently
+          run its existing forward.
+
+        Falls back automatically when ``emit_bf16=True`` is requested but
+        the AITER side cannot supply the bf16 mirror (older builds), in
+        which case we run the unfused ``prepare_mlp`` so callers still get
+        a correct bf16 ``hidden_states``.
+        """
+        if cache is not None:
+            self._context.cache = cache
+        if not self._can_fuse_mlp_quant(forward_batch):
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+
+        post_norm = self.post_attention_layernorm
+        weight = getattr(post_norm, "weight", None)
+        eps = getattr(post_norm, "variance_epsilon", None)
+        if weight is None or eps is None or residual is None:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        if not isinstance(weight, torch.Tensor) or weight.dim() != 1:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        if hidden_states.dtype != weight.dtype:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        if hidden_states.shape[0] == 0:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+
+        # Gemma-style centered RMSNorm stores ``weight``-centered-at-zero and
+        # the layer applies ``(1 + weight)`` at the math step. AITER's fused
+        # kernel multiplies by ``weight`` directly, so when the host
+        # layernorm flags itself as gemma-style we materialize an effective
+        # weight equal to ``1 + weight`` once and cache it on the module.
+        # The cache is invariant after weight loading (weight is a leaf
+        # Parameter that the communicator never mutates), and reusing it
+        # keeps cuda-graph capture stable across replays.
+        if getattr(weight, "_is_gemma_rmsnorm_weight", False):
+            cached = getattr(post_norm, "_aiter_fused_quant_weight", None)
+            if cached is None or cached.shape != weight.shape or cached.dtype != weight.dtype:
+                cached = (weight.detach().to(weight.dtype) + 1.0).contiguous()
+                post_norm._aiter_fused_quant_weight = cached
+            weight = cached
+
+        # Swap the AR half of the fused kernel for the legacy ("old")
+        # custom_all_reduce primitive whenever the rest of the model is using
+        # old-CA (SGLANG_USE_AITER_NEW_CA=false). The ``+ add + rmsnorm +
+        # quant`` epilogue (and the bf16 mirror requested via emit_bf16) is
+        # unchanged in either case, so SGLang sees a byte-identical fused
+        # output regardless of which AR backend ran inside the kernel.
+        result = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+            hidden_states,
+            residual,
+            weight,
+            eps,
+            emit_bf16=emit_bf16,
+            use_old_ca=not _AITER_NEW_CA,
+        )
+        if result is None:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+
+        if emit_bf16:
+            out_fp8, residual_out, scale_out, bf16_out = result
+            return (
+                FusedQuantPack(bf16=bf16_out, fp8=out_fp8, scale=scale_out),
+                residual_out,
+            )
+        out_fp8, residual_out, scale_out = result
+        # Without the bf16 mirror we still need *some* bf16 view to satisfy
+        # callers that read ``.dtype`` / ``.shape``; reuse the residual_out
+        # since it carries identical post-add bf16 semantics (residual is
+        # what the next layer would see as input_layernorm input). The dense
+        # MLP path only ever reads ``bf16.dtype`` for ``apply_fp8_linear``'s
+        # output dtype, so this is correctness-preserving.
+        return (
+            FusedQuantPack(bf16=residual_out, fp8=out_fp8, scale=scale_out),
+            residual_out,
+        )
+
+    def _can_fuse_mlp_quant(self, forward_batch: ForwardBatch) -> bool:
+        """Gate the fused MLP quant path. Fusion is only safe when:
+        - HIP + AITER + old-CA path are active.
+        - We're on the standard (non-DP, non-scattered, non-piecewise-graph)
+          ``_gather_hidden_states_and_residual`` flow that ``prepare_mlp``
+          would otherwise have taken; that's the only flow whose semantics
+          equal AR + RMSNorm + quant on the full-rank hidden_states.
+        """
+        if not _AITER_FUSED_MLP_QUANT_DEFAULT:
+            return False
+        ctx = self._context
+        if ctx.tp_size <= 1:
+            return False
+        if ctx.attn_dp_size != 1:
+            return False
+        if get_attn_tp_context().input_scattered:
+            return False
+        # _gather_hidden_states_and_residual ⇄ (TP_ATTN_FULL → FULL,
+        # SCATTERED/TP_ATTN_FULL → TP_ATTN_FULL) is the only path where the
+        # post-AR hidden_states matches what AITER's fused kernel produces:
+        # full hidden across TP, residual on TP_ATTN_FULL, RMSNorm, then
+        # quant. ``_simple`` does no AR (nothing to fuse) and
+        # ``_scatter_hidden_states_and_residual`` uses reduce-scatter
+        # semantics that the fused AR kernel does not match — both must
+        # fall through to ``prepare_mlp``.
+        fn = self._communicate_with_all_reduce_and_layer_norm_fn
+        if not isinstance(fn, partial):
+            return False
+        if (
+            fn.func
+            is not CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
+        ):
+            return False
+        return True
 
     def postprocess_layer(
         self,

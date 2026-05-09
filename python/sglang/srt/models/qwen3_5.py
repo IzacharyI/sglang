@@ -132,30 +132,43 @@ class Qwen3_5SparseMoeBlock(Qwen2MoeSparseMoeBlock):
     """Qwen3.5-specific MoE block with fused shared expert gating on HIP."""
 
     def _forward_shared_experts(self, hidden_states):
+        # ``hidden_states`` may be a ``FusedQuantPack`` from
+        # ``LayerCommunicator.prepare_mlp_with_quant_fusion``: shared_expert
+        # consumes the pack (so its FP8 ``gate_up_proj`` can skip per-token
+        # quant), while shared_expert_gate (a plain bf16 ``nn.Linear``)
+        # consumes the bf16 view.
+        from sglang.srt.layers.communicator import FusedQuantPack
+
+        bf16_view = (
+            hidden_states.bf16
+            if isinstance(hidden_states, FusedQuantPack)
+            else hidden_states
+        )
+
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
                 if (
                     fused_linear_sigmoid_mul_triton is not None
-                    and hidden_states.is_cuda
+                    and bf16_view.is_cuda
                     and self.shared_expert_gate.bias is None
                     and self.shared_expert_gate.weight.dim() == 2
                     and self.shared_expert_gate.weight.shape[0] == 1
                     and self.shared_expert_gate.weight.shape[1]
-                    == hidden_states.shape[1]
-                    and hidden_states.is_contiguous()
+                    == bf16_view.shape[1]
+                    and bf16_view.is_contiguous()
                     and shared_output.is_contiguous()
                     and self.shared_expert_gate.weight.is_contiguous()
                 ):
                     fused_linear_sigmoid_mul_triton(
-                        hidden_states,
+                        bf16_view,
                         self.shared_expert_gate.weight,
                         shared_output,
                         out=shared_output,
                     )
                 elif _is_hip:
-                    gate_output = self.shared_expert_gate(hidden_states)
+                    gate_output = self.shared_expert_gate(bf16_view)
                     shared_output = fused_sigmoid_mul_broadcast(
                         gate_output, shared_output
                     )
@@ -163,7 +176,7 @@ class Qwen3_5SparseMoeBlock(Qwen2MoeSparseMoeBlock):
                     import torch.nn.functional as F
 
                     shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
+                        F.sigmoid(self.shared_expert_gate(bf16_view))
                         * shared_output
                     )
         return shared_output
@@ -659,9 +672,17 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 forward_batch,
             )
 
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+        # Fully Connected. Sparse MoE asks for the bf16 mirror so the router
+        # gate / shared_expert_gate (both bf16) can keep using it; dense
+        # MLP receives a quant pack whose ``bf16`` view satisfies the same
+        # semantics for any non-FP8 sub-method. ``prepare_mlp_with_quant_fusion``
+        # automatically falls back to the unfused path when fusion is not
+        # safe (DP attn, no AR, gemma-without-cache, etc.).
+        is_sparse_mlp = isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+        hidden_states, residual = (
+            self.layer_communicator.prepare_mlp_with_quant_fusion(
+                hidden_states, residual, forward_batch, emit_bf16=is_sparse_mlp
+            )
         )
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
@@ -673,7 +694,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+        if is_sparse_mlp:
             hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
         else:
             hidden_states = self.mlp(
@@ -909,9 +930,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+        # Fully Connected. See Qwen3_5LinearDecoderLayer.forward above for
+        # the rationale on emit_bf16 and the fused-quant fast path.
+        is_sparse_mlp = isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+        hidden_states, residual = (
+            self.layer_communicator.prepare_mlp_with_quant_fusion(
+                hidden_states, residual, forward_batch, emit_bf16=is_sparse_mlp
+            )
         )
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -922,7 +947,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+        if is_sparse_mlp:
             hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
         else:
             hidden_states = self.mlp(
