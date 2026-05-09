@@ -111,6 +111,23 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("qr_max_size", &qr_max_size);
 
   /*
+   * From csrc/gdn
+   */
+  m.def(
+      "hip_gdn_decode_asm(Tensor query, Tensor key, Tensor value, Tensor a, Tensor b, Tensor dt_bias, Tensor A_log, "
+      "Tensor indices, Tensor state, Tensor! output, int batch_size, int seq_length, int num_v_blocks, "
+      "bool use_qk_l2norm, float scale, int num_k_heads, int num_v_heads) -> ()");
+  m.impl("hip_gdn_decode_asm", torch::kCUDA, &hip_gdn_decode_asm);
+
+  m.def("hip_gdn_state_transpose(Tensor! state, Tensor indices, int batch_size, int num_v_heads) -> ()");
+  m.impl("hip_gdn_state_transpose", torch::kCUDA, &hip_gdn_state_transpose);
+
+  m.def(
+      "hip_gdn_state_transpose_multi_layer(Tensor! state_base, Tensor indices, Tensor! slot_layout, "
+      "int target_layout, int num_layers, int batch_size, int num_v_heads, int layer_stride_floats) -> ()");
+  m.impl("hip_gdn_state_transpose_multi_layer", torch::kCUDA, &hip_gdn_state_transpose_multi_layer);
+
+  /*
    * From csrc/moe
    */
   m.def(

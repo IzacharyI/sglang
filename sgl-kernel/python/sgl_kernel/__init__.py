@@ -65,6 +65,13 @@ from sgl_kernel.gemm import (
     silu_and_mul_scaled_fp4_grouped_quant,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.gdn import (
+    LAYOUT_KV,
+    LAYOUT_VK,
+    hip_fused_sigmoid_gating_delta_rule_update,
+    hip_state_transpose_inplace,
+    hip_state_transpose_inplace_multi_layer,
+)
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,

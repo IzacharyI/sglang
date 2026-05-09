@@ -53,11 +53,11 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu, get_bool_env_var
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
 _is_hip = is_hip()
-_use_hip_linear_attn = get_bool_env_var("USE_HIP_LINEAR_ATTN", "False")
+_use_hip_gdn_decode = _is_hip and Envs.SGLANG_USE_HIP_GDN_DECODE.get()
 
 
 if not is_cpu() and not is_npu():
@@ -873,7 +873,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._num_v_heads_per_layer: int = 0
         self._layout_kv: int = 0
         self._layout_vk: int = 1
-        if _use_hip_linear_attn and _is_hip:
+        if _use_hip_gdn_decode:
             local_num_k_heads = None
             local_num_v_heads = None
             try:
@@ -895,18 +895,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layout_kv = self._layout_kv
             layout_vk = self._layout_vk
             try:
-                from aiter.ops.hip.gated_delta_net import (
+                from sgl_kernel.gdn import (
                     LAYOUT_KV,
                     LAYOUT_VK,
                     hip_fused_sigmoid_gating_delta_rule_update,
                     hip_state_transpose_inplace,
                     hip_state_transpose_inplace_multi_layer,
                 )
-                from aiter.ops.hip.gated_delta_net.hip_gdn_decode import (
-                    _load_extension,
-                )
 
-                _load_extension()
                 hip_vk_kernel_func = hip_fused_sigmoid_gating_delta_rule_update
                 state_transpose_fn = hip_state_transpose_inplace
                 batched_state_transpose_fn = hip_state_transpose_inplace_multi_layer
@@ -914,28 +910,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layout_vk = LAYOUT_VK
             except Exception as e:
                 rank0_log(
-                    f"HIP GDN VK support failed to load: {e}. "
+                    f"Native HIP GDN VK support failed to load: {e}. "
                     "Continuing with the existing decode kernel."
                 )
-
-            if batched_state_transpose_fn is not None:
-                try:
-                    from aiter.ops.hip.gated_delta_net.hip_gdn_decode_flydsl import (
-                        create_flydsl_gdn_decode_layer_runner,
-                        flydsl_fused_sigmoid_gating_delta_rule_update,
-                    )
-
-                    flydsl_vk_kernel_func = (
-                        flydsl_fused_sigmoid_gating_delta_rule_update
-                    )
-                    self._vk_flydsl_layer_runner_factory = (
-                        create_flydsl_gdn_decode_layer_runner
-                    )
-                except Exception as e:
-                    rank0_log(
-                        f"FlyDSL GDN decode support failed to load: {e}. "
-                        "Unsupported shapes will keep the existing decode kernel."
-                    )
 
             if local_num_k_heads is not None and local_num_v_heads is not None:
                 selected_vk_backend = select_vk_gdn_decode_backend(

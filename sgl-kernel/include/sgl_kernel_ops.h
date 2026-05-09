@@ -73,6 +73,35 @@ torch::Tensor qr_get_handle(fptr_t _fa);
 void qr_open_handles(fptr_t _fa, const std::vector<torch::Tensor>& handles);
 void qr_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int64_t quant_level, bool cast_bf2half = false);
 int64_t qr_max_size();
+// GDN decode
+void hip_gdn_decode_asm(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor dt_bias,
+    torch::Tensor A_log,
+    torch::Tensor indices,
+    torch::Tensor state,
+    torch::Tensor output,
+    int64_t batch_size,
+    int64_t seq_length,
+    int64_t num_v_blocks,
+    bool use_qk_l2norm,
+    double scale,
+    int64_t num_k_heads,
+    int64_t num_v_heads);
+void hip_gdn_state_transpose(torch::Tensor state, torch::Tensor indices, int64_t batch_size, int64_t num_v_heads);
+void hip_gdn_state_transpose_multi_layer(
+    torch::Tensor state_base,
+    torch::Tensor indices,
+    torch::Tensor slot_layout,
+    int64_t target_layout,
+    int64_t num_layers,
+    int64_t batch_size,
+    int64_t num_v_heads,
+    int64_t layer_stride_floats);
 #else
 // custom allreduce
 fptr_t

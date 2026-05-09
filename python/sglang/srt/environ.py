@@ -185,7 +185,8 @@ class Envs:
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
-    # CuTe DSL GDN Decode
+    # GDN Decode
+    SGLANG_USE_HIP_GDN_DECODE = EnvBool(False)
     SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
 
     # Test & Debug
