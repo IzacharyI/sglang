@@ -146,18 +146,18 @@ class Qwen2MoeMLP(nn.Module):
     ):
         gate_up, _ = self.gate_up_proj(x)
         if _use_aiter:
-            x = torch.empty(
+            mlp_x = torch.empty(
                 (gate_up.shape[0], gate_up.shape[1] // 2),
                 dtype=gate_up.dtype,
                 device=gate_up.device,
             )
-            self.act_fn(x, gate_up)
+            self.act_fn(mlp_x, gate_up)
         else:
-            x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+            mlp_x = self.act_fn(gate_up)
+        mlp_x, _ = self.down_proj(
+            mlp_x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
-        return x
+        return mlp_x
 
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
@@ -249,14 +249,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         ]
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+    def _forward_shared_experts(self, hidden_states):
+        # ``hidden_states`` is plain bf16; downstream FP8 sub-modules
+        # (gate_up_proj) re-quant on their own.
+        bf16_view = hidden_states
+
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
-                        hidden_states,
+                        bf16_view,
                         self.shared_expert_gate.weight,
                         self.shared_expert_gate.bias,
                         True,
@@ -264,7 +268,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     )
                 else:
                     shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
+                        F.sigmoid(self.shared_expert_gate(bf16_view))
                         * shared_output
                     )
 
@@ -306,9 +310,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        return self._forward_normal_dual_stream(hidden_states, hidden_states)
+
+    def _forward_normal_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+        shared_expert_input,
+    ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(hidden_states)
+        shared_output = self._forward_shared_experts(shared_expert_input)
 
         with torch.cuda.stream(self.alt_stream):
             router_output = self._forward_router_experts(hidden_states)
@@ -322,9 +333,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        shared_expert_input = hidden_states
 
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
@@ -334,11 +347,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
         ):
-            final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states
+            final_hidden_states, shared_output = self._forward_normal_dual_stream(
+                hidden_states, shared_expert_input
             )
         else:
-            shared_output = self._forward_shared_experts(hidden_states)
+            shared_output = self._forward_shared_experts(shared_expert_input)
             final_hidden_states = self._forward_router_experts(hidden_states)
 
         if shared_output is not None:
@@ -347,7 +360,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # An out-of-place add would allocate a new tensor outside symm
             # memory, breaking subsequent symmetric collective operations.
             final_hidden_states += shared_output
-        if self.tp_size > 1 and not use_reduce_scatter:
+        # Skip standalone AR when the caller defers it (cross-layer fusion
+        # or reduce-scatter); the next-layer ``input_layernorm`` fold takes over.
+        if (
+            self.tp_size > 1
+            and not use_reduce_scatter
+            and not should_allreduce_fusion
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)

@@ -1092,7 +1092,12 @@ def apply_fp8_linear(
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
+    pre_quantized: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
+    """When ``pre_quantized=(fp8_input, per_token_scale)`` is supplied, skip
+    the internal per-token quant and use it directly; ``input`` is then only
+    used for output dtype/shape. Used by the AITER fused AR+RMSNorm+quant path.
+    """
     # Note: we pad the input because torch._scaled_mm is more performant
     # for matrices with batch dimension > 16.
     # This could change in the future.
@@ -1107,6 +1112,30 @@ def apply_fp8_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
+
+    if pre_quantized is not None:
+        # Fast path: skip per-token quant; only honored on HIP+aiter rowwise
+        # per-token GEMM. Other backends fall through and re-quant from input.
+        qinput_pre, x_scale_pre = pre_quantized
+        per_tensor_weights_pre = weight_scale.numel() == 1
+        if (
+            _use_aiter
+            and use_per_token_if_dynamic
+            and not per_tensor_weights_pre
+            and qinput_pre.dim() == input_2d.dim()
+        ):
+            output = gemm_a8w8_bpreshuffle(
+                XQ=qinput_pre,
+                WQ=weight.T,
+                x_scale=x_scale_pre,
+                w_scale=weight_scale,
+                dtype=input.dtype,
+            )
+            if bias is not None:
+                output += bias
+            return _process_scaled_mm_output(
+                output, input_2d.shape, output_shape
+            )
 
     if compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
