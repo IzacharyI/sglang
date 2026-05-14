@@ -59,6 +59,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
+    is_aiter_fused_ar_rmsnorm_disabled,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -93,10 +94,10 @@ FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 # model is using old-CA (SGLANG_USE_AITER_NEW_CA=false), otherwise the
 # fused kernel's AR half would mismatch the surrounding new-CA dispatch.
 _AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
-_AITER_FUSED_MLP_QUANT_DEFAULT = (
+_AITER_FUSED_AR_RMSNORM_DEFAULT = (
     _use_aiter
     and not _AITER_NEW_CA
-    and not get_bool_env_var("SGLANG_DISABLE_AITER_FUSED_MLP_QUANT", "false")
+    and not is_aiter_fused_ar_rmsnorm_disabled()
 )
 # Decode-only by default: prefill is GEMM-bound and AITER's fused kernel
 # falls to a split path for large m, so the win is concentrated on the
@@ -635,7 +636,7 @@ class LayerCommunicator:
         whose semantics equal AR + RMSNorm on the full-rank hidden_states).
         Decode-only by default (see ``SGLANG_FUSED_AR_RMSNORM_DECODE_ONLY``).
         """
-        if not _AITER_FUSED_MLP_QUANT_DEFAULT:
+        if not _AITER_FUSED_AR_RMSNORM_DEFAULT:
             return False
         if (
             _AITER_FUSED_AR_RMSNORM_DECODE_ONLY
@@ -714,7 +715,7 @@ class LayerCommunicator:
         # HIP/AITER/old-CA cross-layer fusion: defer this layer's tail AR
         # so the next layer's ``input_layernorm.forward_with_allreduce_fusion``
         # can fold AR + add + RMSNorm into one kernel. Decode-only by default.
-        if _AITER_FUSED_MLP_QUANT_DEFAULT and self._context.attn_dp_size == 1:
+        if _AITER_FUSED_AR_RMSNORM_DEFAULT and self._context.attn_dp_size == 1:
             if (
                 _AITER_FUSED_AR_RMSNORM_DECODE_ONLY
                 and not forward_batch.forward_mode.is_decode_or_idle()

@@ -30,6 +30,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    is_aiter_fused_ar_rmsnorm_disabled,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -55,7 +56,7 @@ _AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
 _AITER_FUSED_NORM_DEFAULT = (
     _use_aiter
     and not _AITER_NEW_CA
-    and not get_bool_env_var("SGLANG_DISABLE_AITER_FUSED_MLP_QUANT", "false")
+    and not is_aiter_fused_ar_rmsnorm_disabled()
 )
 
 if _is_cuda or _is_xpu:
