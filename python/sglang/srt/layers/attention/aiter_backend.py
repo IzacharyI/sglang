@@ -99,6 +99,12 @@ global_workspace_buffer = None
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
+def _get_aiter_paged_ragged_kv_cache_dtype(kv_cache_dtype) -> str:
+    if kv_cache_dtype != fp8_dtype:
+        return "auto"
+    return "fp8_e4m3"
+
+
 class AiterAttnBackend(AttentionBackend):
     def __init__(
         self,
@@ -1764,12 +1770,16 @@ class AiterAttnBackend(AttentionBackend):
                 layer.layer_id
             )
 
-            # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
+            ragged_kv_cache_dtype = _get_aiter_paged_ragged_kv_cache_dtype(
+                self.kv_cache_dtype
+            )
+            ragged_k_scale = self.k_scale
+            ragged_v_scale = self.v_scale
             if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+                layer_k_scale = getattr(layer, "k_scale", None)
+                layer_v_scale = getattr(layer, "v_scale", None)
+                ragged_k_scale = layer_k_scale if layer_k_scale is not None else self.k_scale
+                ragged_v_scale = layer_v_scale if layer_v_scale is not None else self.v_scale
 
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1784,11 +1794,11 @@ class AiterAttnBackend(AttentionBackend):
                 1,
                 self.max_num_partitions,
                 None,
-                "auto",
+                ragged_kv_cache_dtype,
                 "NHD",
                 self.logits_soft_cap,
-                self.k_scale,
-                self.v_scale,
+                ragged_k_scale,
+                ragged_v_scale,
                 None,
                 _AITER_PARTITION_SIZE_ROCM,
             )
