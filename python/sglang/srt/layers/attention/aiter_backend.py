@@ -1279,8 +1279,15 @@ class AiterAttnBackend(AttentionBackend):
                 if self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
+                    layer_k_scale = getattr(layer, "k_scale", None)
+                    layer_v_scale = getattr(layer, "v_scale", None)
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        layer_k_scale if layer_k_scale is not None else self.k_scale,
+                        layer_v_scale if layer_v_scale is not None else self.v_scale,
                     )
 
         if self.use_mla:
@@ -1678,7 +1685,11 @@ class AiterAttnBackend(AttentionBackend):
                     if getattr(layer, "v_scale", None) is not None
                     else self.v_scale
                 )
-                q_descale = torch.ones_like(k_descale, dtype=torch.float32)
+                q_descale = (
+                    self.k_scale
+                    if self.k_scale.shape == k_descale.shape
+                    else torch.ones_like(k_descale, dtype=torch.float32)
+                )
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
