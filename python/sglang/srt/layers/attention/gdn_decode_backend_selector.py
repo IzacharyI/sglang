@@ -79,12 +79,7 @@ def sync_gdn_slot_layout_after_copy(
     """Keep layout metadata consistent with SSM state row copies."""
     if slot_layout is None or src_indices.numel() == 0 or dst_indices.numel() == 0:
         return
-    valid = (src_indices >= 0) & (dst_indices >= 0)
-    if not torch.any(valid):
-        return
-    src = src_indices[valid].to(dtype=torch.long)
-    dst = dst_indices[valid].to(dtype=torch.long)
-    slot_layout[dst] = slot_layout[src]
+    slot_layout[dst_indices] = slot_layout[src_indices]
 
 
 def target_gdn_state_layout(

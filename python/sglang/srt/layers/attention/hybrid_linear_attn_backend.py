@@ -13,7 +13,6 @@ from sglang.srt.layers.attention.gdn_decode_backend_selector import (
     get_local_gdn_head_shape,
     select_vk_gdn_decode_backend,
     supports_hip_gdn_decode_runtime,
-    sync_gdn_slot_layout_after_copy,
     target_gdn_state_layout,
 )
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -255,6 +254,113 @@ def sync_gdn_slot_layout_after_masked_copy(
         cache_indices,
         mamba_track_mask,
         mamba_track_indices,
+    )
+
+
+@triton.jit
+def copy_h_to_ssm_track_kernel(
+    h_ptr,
+    ssm_states_ptr,
+    src_indices_ptr,
+    dst_indices_ptr,
+    slot_layout_ptr,
+    h_stride_0,
+    ssm_stride_0,
+    row_numel: tl.constexpr,
+    layout_kv: tl.constexpr,
+    HAS_LAYOUT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pair_idx = tl.program_id(0)
+    tile_idx = tl.program_id(1)
+    offsets = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < row_numel
+
+    src_idx = tl.load(src_indices_ptr + pair_idx)
+    dst_idx = tl.load(dst_indices_ptr + pair_idx)
+
+    data = tl.load(h_ptr + src_idx * h_stride_0 + offsets, mask=mask, other=0.0)
+    tl.store(ssm_states_ptr + dst_idx * ssm_stride_0 + offsets, data, mask=mask)
+
+    if HAS_LAYOUT and tile_idx == 0:
+        tl.store(slot_layout_ptr + dst_idx, layout_kv)
+
+
+@triton.jit
+def copy_ssm_to_ssm_track_kernel(
+    ssm_states_ptr,
+    src_indices_ptr,
+    dst_indices_ptr,
+    slot_layout_ptr,
+    ssm_stride_0,
+    row_numel: tl.constexpr,
+    HAS_LAYOUT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pair_idx = tl.program_id(0)
+    tile_idx = tl.program_id(1)
+    offsets = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < row_numel
+
+    src_idx = tl.load(src_indices_ptr + pair_idx)
+    dst_idx = tl.load(dst_indices_ptr + pair_idx)
+
+    data = tl.load(ssm_states_ptr + src_idx * ssm_stride_0 + offsets, mask=mask, other=0.0)
+    tl.store(ssm_states_ptr + dst_idx * ssm_stride_0 + offsets, data, mask=mask)
+
+    if HAS_LAYOUT and tile_idx == 0:
+        layout = tl.load(slot_layout_ptr + src_idx)
+        tl.store(slot_layout_ptr + dst_idx, layout)
+
+
+def copy_h_to_ssm_track(
+    h: torch.Tensor,
+    ssm_states: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    slot_layout: Optional[torch.Tensor],
+    layout_kv: int,
+) -> None:
+    if src_indices.numel() == 0:
+        return
+    row_numel = ssm_states[0].numel()
+    block_size = 1024
+    grid = (src_indices.numel(), triton.cdiv(row_numel, block_size))
+    copy_h_to_ssm_track_kernel[grid](
+        h,
+        ssm_states,
+        src_indices,
+        dst_indices,
+        slot_layout if slot_layout is not None else ssm_states,
+        h.stride(0),
+        ssm_states.stride(0),
+        row_numel,
+        layout_kv,
+        slot_layout is not None,
+        block_size,
+    )
+
+
+def copy_ssm_to_ssm_track(
+    ssm_states: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    slot_layout: Optional[torch.Tensor],
+) -> None:
+    if src_indices.numel() == 0:
+        return
+    row_numel = ssm_states[0].numel()
+    block_size = 1024
+    grid = (src_indices.numel(), triton.cdiv(row_numel, block_size))
+    copy_ssm_to_ssm_track_kernel[grid](
+        ssm_states,
+        src_indices,
+        dst_indices,
+        slot_layout if slot_layout is not None else ssm_states,
+        ssm_states.stride(0),
+        row_numel,
+        slot_layout is not None,
+        block_size,
     )
 
 
@@ -708,24 +814,22 @@ class MambaAttnBackendBase(AttentionBackend):
         using indices computed by `_init_track_conv_indices`.
         """
         if forward_metadata.has_mamba_track_mask:
-            h = h.squeeze(0)
-
             if forward_metadata.track_ssm_h_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                    forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
-                if self._slot_layout is not None:
-                    self._slot_layout[forward_metadata.track_ssm_h_dst.long()] = (
-                        self._layout_kv
-                    )
-            if forward_metadata.track_ssm_final_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
-                    forward_metadata.track_ssm_final_src
-                ]
-                sync_gdn_slot_layout_after_copy(
+                h = h.squeeze(0)
+                copy_h_to_ssm_track(
+                    h,
+                    ssm_states,
+                    forward_metadata.track_ssm_h_src,
+                    forward_metadata.track_ssm_h_dst,
                     self._slot_layout,
+                    self._layout_kv,
+                )
+            if forward_metadata.track_ssm_final_src.numel() > 0:
+                copy_ssm_to_ssm_track(
+                    ssm_states,
                     forward_metadata.track_ssm_final_src,
                     forward_metadata.track_ssm_final_dst,
+                    self._slot_layout,
                 )
 
 
