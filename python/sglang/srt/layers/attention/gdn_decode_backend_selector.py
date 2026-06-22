@@ -76,7 +76,14 @@ def sync_gdn_slot_layout_after_copy(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
 ) -> None:
-    """Keep layout metadata consistent with SSM state row copies."""
+    """Keep layout metadata consistent with SSM state row copies.
+
+    Mirrors the ``ssm_states[dst] = ssm_states[src]`` scatter at the call site
+    using the exact same index tensors. Those indices are already valid slot ids
+    (the state scatter applies them unguarded), so we deliberately avoid any
+    ``torch.any`` / boolean-mask / ``.to(long)`` here: each of those forces a
+    device->host sync (or an int32->int64 copy) and stalls the GDN prefill stream.
+    """
     if slot_layout is None or src_indices.numel() == 0 or dst_indices.numel() == 0:
         return
     slot_layout[dst_indices] = slot_layout[src_indices]
