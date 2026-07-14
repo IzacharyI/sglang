@@ -72,7 +72,11 @@ if not is_cpu() and not is_npu():
         # CuTe DSL path requires cuda-python (cuda.bindings.*). Keep runtime usable
         # by falling back to non-CuTe kernels when it's unavailable.
         cutedsl_fused_sigmoid_gating_delta_rule_update = None
-    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.srt.layers.attention.fla.chunk import (
+        aiter_prefill_opt_vk_enabled,
+        chunk_gated_delta_rule,
+        chunk_gated_delta_rule_prefill_opt_vk_no_h,
+    )
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
@@ -267,7 +271,7 @@ def copy_h_to_ssm_track_kernel(
     h_stride_0,
     ssm_stride_0,
     row_numel: tl.constexpr,
-    layout_kv: tl.constexpr,
+    producer_layout: tl.constexpr,
     HAS_LAYOUT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -283,7 +287,7 @@ def copy_h_to_ssm_track_kernel(
     tl.store(ssm_states_ptr + dst_idx * ssm_stride_0 + offsets, data, mask=mask)
 
     if HAS_LAYOUT and tile_idx == 0:
-        tl.store(slot_layout_ptr + dst_idx, layout_kv)
+        tl.store(slot_layout_ptr + dst_idx, producer_layout)
 
 
 @triton.jit
@@ -319,7 +323,7 @@ def copy_h_to_ssm_track(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     slot_layout: Optional[torch.Tensor],
-    layout_kv: int,
+    producer_layout: int,
 ) -> None:
     if src_indices.numel() == 0:
         return
@@ -335,7 +339,7 @@ def copy_h_to_ssm_track(
         h.stride(0),
         ssm_states.stride(0),
         row_numel,
-        layout_kv,
+        producer_layout,
         slot_layout is not None,
         block_size,
     )
@@ -800,6 +804,7 @@ class MambaAttnBackendBase(AttentionBackend):
         h: torch.Tensor,
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
+        h_layout: Optional[int] = None,
     ):
         """
         Track and copy SSM states during extend for prefix caching.
@@ -822,7 +827,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_metadata.track_ssm_h_src,
                     forward_metadata.track_ssm_h_dst,
                     self._slot_layout,
-                    self._layout_kv,
+                    self._layout_kv if h_layout is None else h_layout,
                 )
             if forward_metadata.track_ssm_final_src.numel() > 0:
                 copy_ssm_to_ssm_track(
@@ -1032,6 +1037,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._num_v_heads_per_layer: int = 0
         self._layout_kv: int = 0
         self._layout_vk: int = 1
+        # Device-side scalar mirror of _layout_vk (avoids a per-layer H2D sync on scatter).
+        self._layout_vk_scalar: Optional[torch.Tensor] = None
+        self._prefill_opt_vk_enabled: bool = False
         if _use_hip_linear_attn and _is_hip:
             local_num_k_heads = None
             local_num_v_heads = None
@@ -1147,6 +1155,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self._full_temporal_state = full_temporal
                     self._num_mamba_layers = full_temporal.shape[0]
                     self._num_v_heads_per_layer = full_temporal.shape[2]
+                    self._prefill_opt_vk_enabled = aiter_prefill_opt_vk_enabled()
                     total_slots = full_temporal.shape[1]
                     # Share the pool-owned bitmap (single source of truth) so
                     # prefix-cache reuse can't desync the KV<->VK layout.
@@ -1159,7 +1168,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         f"{selected_vk_backend.upper()} GDN decode loaded "
                         f"(local heads {local_num_k_heads}/{local_num_v_heads}, "
                         f"{self._num_mamba_layers} layers, batched multi-layer "
-                        "transpose, per-slot gate)."
+                        "transpose, per-slot gate, "
+                        f"prefill opt-vk={self._prefill_opt_vk_enabled})."
                     )
                 else:
                     rank0_log(
@@ -1209,6 +1219,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layout_kv=self._layout_kv,
             layout_vk=self._layout_vk,
         )
+        if forward_mode.is_extend() and self._prefill_opt_vk_enabled:
+            target_layout = self._layout_vk
         if target_layout is not None:
             self._eager_apply_layout_transition(target_layout)
         if (
@@ -1602,18 +1614,62 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if is_npu() or is_cpu():
                 recurrent_state = ssm_states[cache_indices]
                 recurrent_state_indices_args = {}
-            core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                cu_seqlens=query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-                **recurrent_state_indices_args,
+            prefill_state_layout = (
+                self._layout_vk if self._prefill_opt_vk_enabled else self._layout_kv
             )
+            need_intermediate_h = not self._prefill_opt_vk_enabled or (
+                forward_metadata.has_mamba_track_mask
+                and forward_metadata.track_ssm_h_src.numel() > 0
+            )
+            if self._prefill_opt_vk_enabled and not need_intermediate_h:
+                core_attn_out, last_recurrent_state, h = (
+                    chunk_gated_delta_rule_prefill_opt_vk_no_h(
+                        q=query,
+                        k=key,
+                        v=value,
+                        g=g,
+                        beta=beta,
+                        scale=key.shape[-1] ** -0.5,
+                        initial_state=recurrent_state,
+                        initial_state_indices=cache_indices,
+                        cu_seqlens=query_start_loc,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
+            else:
+                core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    cu_seqlens=query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                    initial_state_layout=prefill_state_layout,
+                    output_state_layout=prefill_state_layout,
+                    return_intermediate_h=need_intermediate_h,
+                    **recurrent_state_indices_args,
+                )
+            if (
+                self._prefill_opt_vk_enabled
+                and self._slot_layout is not None
+                and cache_indices is not None
+                and cache_indices.numel() > 0
+            ):
+                # Scatter via the cached device scalar to keep it on-device (no H2D sync).
+                if (
+                    self._layout_vk_scalar is None
+                    or self._layout_vk_scalar.device != self._slot_layout.device
+                    or self._layout_vk_scalar.dtype != self._slot_layout.dtype
+                ):
+                    self._layout_vk_scalar = torch.tensor(
+                        self._layout_vk,
+                        dtype=self._slot_layout.dtype,
+                        device=self._slot_layout.device,
+                    )
+                self._slot_layout[cache_indices] = self._layout_vk_scalar
             if is_npu() or is_cpu():
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
@@ -1621,11 +1677,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states[cache_indices] = last_recurrent_state
 
             self._track_mamba_state_extend(
-                forward_batch, h, ssm_states, forward_metadata
+                forward_batch,
+                h,
+                ssm_states,
+                forward_metadata,
+                h_layout=prefill_state_layout,
             )
 
-            # KV→VK is deferred to the next decode pass entry
-            # (_eager_apply_layout_transition).
+            # opt-vk leaves slots in VK; otherwise KV->VK defers to the next decode entry.
 
         return core_attn_out
 

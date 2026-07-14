@@ -613,7 +613,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og[0], -1)
+        core_attn_out = core_attn_out.view(z_shape_og[0], -1)
 
         output, _ = self.out_proj(core_attn_out)
         return output
