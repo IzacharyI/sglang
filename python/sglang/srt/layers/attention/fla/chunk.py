@@ -110,7 +110,8 @@ def aiter_prefill_opt_vk_enabled() -> bool:
 
 
 def selected_aiter_prefill_opt_vk_k5_backend() -> str:
-    backend = os.getenv("SGLANG_GDN_PREFILL_OPT_VK_K5", "auto").lower()
+    # K5 (chunk-delta-h) backend: default "hip"; override with "triton"/"auto".
+    backend = os.getenv("SGLANG_GDN_PREFILL_OPT_VK_K5", "hip").lower()
     if backend not in ("auto", "hip", "triton"):
         raise ValueError(
             "SGLANG_GDN_PREFILL_OPT_VK_K5 must be 'auto', 'hip', or 'triton', "
