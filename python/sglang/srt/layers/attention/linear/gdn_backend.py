@@ -5,6 +5,7 @@ import torch
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
+    causal_conv1d_fn_split_qkv,
     causal_conv1d_update,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
@@ -17,7 +18,7 @@ from sglang.srt.layers.attention.linear.utils import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
@@ -33,6 +34,87 @@ if is_cuda() or is_hip():
     )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+
+
+def can_use_hip_gdn_prefill_conv_qkv_split(
+    *,
+    forward_mode: ForwardMode,
+    is_hip_platform: bool,
+    mixed_qkv: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: Optional[torch.Tensor],
+    has_initial_state: Optional[torch.Tensor],
+    q_dim: int,
+    k_dim: int,
+    v_dim: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_q_dim: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    enable_page_major_kv_layout: bool,
+    needs_state_gather: bool,
+) -> bool:
+    """Return whether HIP ordinary prefill may use direct causal-conv QKV stores."""
+    if (
+        forward_mode != ForwardMode.EXTEND
+        or not is_hip_platform
+        or not mixed_qkv.is_cuda
+        or enable_page_major_kv_layout
+        or needs_state_gather
+    ):
+        return False
+
+    qkv_dim = q_dim + k_dim + v_dim
+    if (
+        qkv_dim > MAX_FUSED_QKV_SPLIT_DIM
+        or mixed_qkv.dtype != torch.bfloat16
+        or mixed_qkv.ndim != 2
+        or mixed_qkv.shape[0] != qkv_dim
+        or mixed_qkv.stride(0) != 1
+        or weight.ndim != 2
+        or weight.shape[0] != qkv_dim
+        or weight.shape[1] not in (2, 3, 4)
+        or conv_states.ndim != 3
+        or conv_states.shape[1] != qkv_dim
+        or conv_states.shape[2] < weight.shape[1] - 1
+        or weight.dtype != mixed_qkv.dtype
+        or conv_states.dtype != mixed_qkv.dtype
+        or query_start_loc.dtype != torch.int32
+        or num_q_heads * head_q_dim != q_dim
+        or num_k_heads * head_k_dim != k_dim
+        or num_v_heads * head_v_dim != v_dim
+    ):
+        return False
+
+    device = mixed_qkv.device
+    required_tensors = (weight, conv_states, query_start_loc)
+    if any(
+        not tensor.is_cuda or tensor.device != device for tensor in required_tensors
+    ):
+        return False
+    if bias is not None and (not bias.is_cuda or bias.device != device):
+        return False
+    if bias is not None and bias.dtype != mixed_qkv.dtype:
+        return False
+    if cache_indices is not None and (
+        not cache_indices.is_cuda
+        or cache_indices.device != device
+        or cache_indices.dtype != torch.int32
+    ):
+        return False
+    if has_initial_state is not None and (
+        not has_initial_state.is_cuda
+        or has_initial_state.device != device
+        or has_initial_state.dtype != torch.bool
+    ):
+        return False
+    return True
+
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -336,6 +418,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.enable_page_major_kv_layout = (
+            model_runner.server_args.enable_page_major_kv_layout
+        )
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -517,6 +602,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
+        used_hip_fused_conv_qkv_split = False
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -547,39 +633,89 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
+            use_hip_fused_conv_qkv_split = can_use_hip_gdn_prefill_conv_qkv_split(
+                forward_mode=forward_batch.forward_mode,
+                is_hip_platform=is_hip(),
+                mixed_qkv=mixed_qkv,
+                weight=layer.conv_weights,
+                bias=layer.bias,
                 conv_states=conv_states_contig,
-                has_initial_state=has_initial_states,
-                cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+                cache_indices=state_cache_indices,
+                has_initial_state=has_initial_states,
+                q_dim=layer.q_dim,
+                k_dim=layer.k_dim,
+                v_dim=layer.v_dim,
+                num_q_heads=layer.num_q_heads,
+                num_k_heads=layer.num_k_heads,
+                num_v_heads=layer.num_v_heads,
+                head_q_dim=layer.head_q_dim,
+                head_k_dim=layer.head_k_dim,
+                head_v_dim=layer.head_v_dim,
+                enable_page_major_kv_layout=self.enable_page_major_kv_layout,
+                needs_state_gather=needs_state_gather,
+            )
+            if use_hip_fused_conv_qkv_split:
+                query, key, value = causal_conv1d_fn_split_qkv(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    conv_states_contig,
+                    query_start_loc,
+                    forward_batch.extend_seq_lens_cpu,
+                    layer.q_dim,
+                    layer.k_dim,
+                    layer.v_dim,
+                    num_q_heads=layer.num_q_heads,
+                    num_k_heads=layer.num_k_heads,
+                    num_v_heads=layer.num_v_heads,
+                    head_q_dim=layer.head_q_dim,
+                    head_k_dim=layer.head_k_dim,
+                    head_v_dim=layer.head_v_dim,
+                    cache_indices=state_cache_indices,
+                    has_initial_state=has_initial_states,
+                    activation=layer.activation,
+                )
+                used_hip_fused_conv_qkv_split = True
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states_contig,
+                    has_initial_state=has_initial_states,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
 
-        actual_seq_len = mixed_qkv.shape[0]
-        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
-            query, key, value = fused_qkv_split_gdn_prefill(
-                mixed_qkv,
-                layer.num_q_heads,
-                layer.num_k_heads,
-                layer.num_v_heads,
-                layer.head_q_dim,
-                layer.head_k_dim,
-                layer.head_v_dim,
-            )
-        else:
-            query, key, value = torch.split(
-                mixed_qkv,
-                [layer.q_dim, layer.k_dim, layer.v_dim],
-                dim=-1,
-            )
-            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+        if not used_hip_fused_conv_qkv_split:
+            actual_seq_len = mixed_qkv.shape[0]
+            qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+            if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+                query, key, value = fused_qkv_split_gdn_prefill(
+                    mixed_qkv,
+                    layer.num_q_heads,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_q_dim,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                )
+            else:
+                query, key, value = torch.split(
+                    mixed_qkv,
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                    dim=-1,
+                )
+                query = query.view(
+                    1, actual_seq_len, layer.num_q_heads, layer.head_q_dim
+                )
+                key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+                value = value.view(
+                    1, actual_seq_len, layer.num_v_heads, layer.head_v_dim
+                )
 
         if is_target_verify:
             # ReplaySSM spec-verify (Part B of #28511): when the per-slot ring is

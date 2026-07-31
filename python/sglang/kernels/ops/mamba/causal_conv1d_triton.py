@@ -4,7 +4,7 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
 
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -26,10 +26,16 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     has_initial_states_ptr,
     query_start_loc_ptr,
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
+    q_ptr,
+    k_ptr,
+    v_ptr,
     # Matrix dimensions
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
     num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
+    q_dim: tl.constexpr,
+    k_dim: tl.constexpr,
+    v_dim: tl.constexpr,
     # Strides
     stride_x_seq: tl.constexpr,  # stride to get to next sequence,
     stride_x_dim: tl.constexpr,  # stride to get to next feature-value,
@@ -42,6 +48,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.constexpr,
+    stride_q_token: tl.constexpr,
+    stride_q_dim: tl.constexpr,
+    stride_k_token: tl.constexpr,
+    stride_k_dim: tl.constexpr,
+    stride_v_token: tl.constexpr,
+    stride_v_dim: tl.constexpr,
     # others
     pad_slot_id: tl.constexpr,
     # Meta-parameters
@@ -55,6 +67,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SPLIT_QKV: tl.constexpr,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -370,13 +383,179 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
+        if SPLIT_QKV:
+            global_token_idx = sequence_start_index + token_offset + idx_token
+            q_ptrs = (
+                q_ptr + global_token_idx * stride_q_token + idx_feats * stride_q_dim
+            )
+            tl.store(q_ptrs, acc, mask=mask_1d & (idx_feats < q_dim))
+
+            k_ptrs = (
+                k_ptr
+                + global_token_idx * stride_k_token
+                + (idx_feats - q_dim) * stride_k_dim
+            )
+            tl.store(
+                k_ptrs,
+                acc,
+                mask=mask_1d & (idx_feats >= q_dim) & (idx_feats < q_dim + k_dim),
+            )
+
+            v_ptrs = (
+                v_ptr
+                + global_token_idx * stride_v_token
+                + (idx_feats - q_dim - k_dim) * stride_v_dim
+            )
+            tl.store(
+                v_ptrs,
+                acc,
+                mask=mask_1d
+                & (idx_feats >= q_dim + k_dim)
+                & (idx_feats < q_dim + k_dim + v_dim),
+            )
+        else:
+            o_ptrs = (
+                o_ptr
+                + (sequence_start_index + token_offset + idx_token) * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
+
+            tl.store(o_ptrs, acc, mask=mask_1d)
+
+
+def _launch_causal_conv1d_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    conv_states: Optional[torch.Tensor],
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    cache_indices: Optional[torch.Tensor],
+    has_initial_state: Optional[torch.Tensor],
+    pad_slot_id: int,
+    activation: Optional[str],
+    *,
+    out: torch.Tensor,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    v_out: Optional[torch.Tensor] = None,
+    q_dim: int = 0,
+    k_dim: int = 0,
+    v_dim: int = 0,
+) -> None:
+    """Launch the shared causal-conv forward kernel for packed or split stores."""
+    dim, cu_seqlen = x.shape
+    _, width = weight.shape
+    state_len = width - 1
+    np2_statelen = triton.next_power_of_2(state_len)
+
+    stride_istate_seq = 0
+    stride_istate_dim = 0
+    stride_istate_token = 0
+    num_cache_lines = 0
+    if conv_states is not None:
+        num_cache_lines = conv_states.size(0)
+        assert (
+            num_cache_lines == conv_states.shape[0]
+            and dim == conv_states.shape[1]
+            and width - 1 <= conv_states.shape[2]
+        )
+        stride_istate_seq = conv_states.stride(0)
+        stride_istate_dim = conv_states.stride(1)
+        stride_istate_token = conv_states.stride(2)
+
+    if out.dim() == 2:
+        stride_o_seq = 0
+        stride_o_dim = out.stride(0)
+        stride_o_token = out.stride(1)
+    else:
+        stride_o_seq = out.stride(0)
+        stride_o_dim = out.stride(1)
+        stride_o_token = out.stride(2)
+
+    split_qkv = q_out is not None
+    if split_qkv:
+        assert k_out is not None and v_out is not None
+        q_ptr = q_out
+        k_ptr = k_out
+        v_ptr = v_out
+        stride_q_token = q_out.stride(1)
+        stride_q_dim = q_out.stride(3)
+        stride_k_token = k_out.stride(1)
+        stride_k_dim = k_out.stride(3)
+        stride_v_token = v_out.stride(1)
+        stride_v_dim = v_out.stride(3)
+    else:
+        q_ptr = out
+        k_ptr = out
+        v_ptr = out
+        q_dim = 0
+        k_dim = 0
+        v_dim = 0
+        stride_q_token = 0
+        stride_q_dim = 0
+        stride_k_token = 0
+        stride_k_dim = 0
+        stride_v_token = 0
+        stride_v_dim = 0
+
+    def grid(META):
+        max_seq_len = max(seq_lens_cpu)
+        return (
+            len(seq_lens_cpu),
+            (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"],
+            triton.cdiv(dim, META["BLOCK_N"]),
         )
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+    _causal_conv1d_fwd_kernel[grid](
+        x,
+        weight,
+        bias,
+        conv_states,
+        cache_indices,
+        has_initial_state,
+        query_start_loc,
+        out,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        dim,
+        cu_seqlen,
+        num_cache_lines,
+        q_dim,
+        k_dim,
+        v_dim,
+        0,
+        x.stride(0),
+        x.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        stride_istate_seq,
+        stride_istate_dim,
+        stride_istate_token,
+        stride_o_seq,
+        stride_o_dim,
+        stride_o_token,
+        stride_q_token,
+        stride_q_dim,
+        stride_k_token,
+        stride_k_dim,
+        stride_v_token,
+        stride_v_dim,
+        pad_slot_id,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        HAS_INITIAL_STATES=has_initial_state is not None,
+        HAS_CACHE=conv_states is not None,
+        IS_CONTINUOUS_BATCHING=cache_indices is not None,
+        USE_PAD_SLOT=pad_slot_id is not None,
+        NP2_STATELEN=np2_statelen,
+        BLOCK_M=8,
+        BLOCK_N=256,
+        SPLIT_QKV=split_qkv,
+        num_stages=2,
+    )
 
 
 def causal_conv1d_fn(
@@ -443,44 +622,8 @@ def causal_conv1d_fn(
     out = torch.empty_like(x)
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
-    dim, cu_seqlen = x.shape
+    dim, _ = x.shape
     _, width = weight.shape
-    state_len = width - 1
-    np2_statelen = triton.next_power_of_2(state_len)
-
-    stride_x_seq = 0
-    stride_x_dim = x.stride(0)
-    stride_x_token = x.stride(1)
-    stride_w_dim = weight.stride(0)
-    stride_w_width = weight.stride(1)
-    stride_istate_seq = 0
-    stride_istate_dim = 0
-    stride_istate_token = 0
-    num_cache_lines = 0
-    if conv_states is not None:
-        # extensions to support vLLM:
-        # 1. conv_states is used to replaced initial_states
-        # 2. conv_states serve as a cache with num cache lines can be larger than batch size
-        # 3. mapping from sequence x[idx] to a cache line at index as specified via cache_indices[idx]
-        # 4. computation can be skipped if cache_indices[idx] == pad_slot_id
-        num_cache_lines = conv_states.size(0)
-        assert (
-            num_cache_lines == conv_states.shape[0]
-            and dim == conv_states.shape[1]
-            and width - 1 <= conv_states.shape[2]
-        )
-        stride_istate_seq = conv_states.stride(0)
-        stride_istate_dim = conv_states.stride(1)
-        stride_istate_token = conv_states.stride(2)
-        # assert stride_istate_dim == 1
-    if out.dim() == 2:
-        stride_o_seq = 0
-        stride_o_dim = out.stride(0)
-        stride_o_token = out.stride(1)
-    else:
-        stride_o_seq = out.stride(0)
-        stride_o_dim = out.stride(1)
-        stride_o_token = out.stride(2)
 
     if validate_data:
         assert x.dim() == 2
@@ -503,57 +646,120 @@ def causal_conv1d_fn(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
-    def grid(META):
-        max_seq_len = max(seq_lens_cpu)
-        return (
-            len(seq_lens_cpu),  # batch_size
-            (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"],
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
-
-    _causal_conv1d_fwd_kernel[grid](
-        # Pointers to matrices
+    _launch_causal_conv1d_fwd(
         x,
         weight,
         bias,
         conv_states,
+        query_start_loc,
+        seq_lens_cpu,
         cache_indices,
         has_initial_state,
-        query_start_loc,
-        out,
-        # Matrix dimensions
-        dim,
-        cu_seqlen,
-        num_cache_lines,
-        # stride
-        stride_x_seq,
-        stride_x_dim,
-        stride_x_token,
-        stride_w_dim,
-        stride_w_width,
-        stride_istate_seq,
-        stride_istate_dim,
-        stride_istate_token,
-        stride_o_seq,
-        stride_o_dim,
-        stride_o_token,
-        # others
         pad_slot_id,
-        # META
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        HAS_INITIAL_STATES=has_initial_state is not None,
-        HAS_CACHE=conv_states is not None,
-        IS_CONTINUOUS_BATCHING=cache_indices is not None,
-        USE_PAD_SLOT=pad_slot_id is not None,
-        NP2_STATELEN=np2_statelen,
-        # launch_cooperative_grid=True
-        BLOCK_M=8,
-        BLOCK_N=256,
-        num_stages=2,
+        activation,
+        out=out,
     )
     return out
+
+
+def causal_conv1d_fn_split_qkv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    q_dim: int,
+    k_dim: int,
+    v_dim: int,
+    *,
+    num_q_heads: int = 1,
+    num_k_heads: int = 1,
+    num_v_heads: int = 1,
+    head_q_dim: Optional[int] = None,
+    head_k_dim: Optional[int] = None,
+    head_v_dim: Optional[int] = None,
+    cache_indices: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    activation: Optional[str] = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run varlen causal-conv and directly store contiguous GDN Q/K/V tensors.
+
+    The output tensors have the same ``[1, T, H, D]`` layouts as
+    :func:`fused_qkv_split_gdn_prefill`. This path intentionally owns only the
+    output stores; the convolution and in-place conv-state update remain in
+    ``_causal_conv1d_fwd_kernel``. Width 5 intentionally remains on the
+    existing packed-output path.
+    """
+    if isinstance(activation, bool):
+        activation = "silu" if activation else None
+    if activation not in (None, "silu", "swish"):
+        raise ValueError(f"Unsupported causal-conv activation: {activation!r}")
+    if len(seq_lens_cpu) == 0:
+        raise ValueError("seq_lens_cpu must contain at least one sequence")
+
+    dim, cu_seqlen = x.shape
+    if dim != q_dim + k_dim + v_dim:
+        raise ValueError(
+            f"QKV dimensions ({q_dim} + {k_dim} + {v_dim}) must equal {dim=}"
+        )
+    if weight.ndim != 2 or weight.shape[0] != dim:
+        raise ValueError(
+            f"Expected weight with shape ({dim}, width), got {tuple(weight.shape)}"
+        )
+    _, width = weight.shape
+    if width not in (2, 3, 4):
+        raise ValueError(f"Unsupported causal-conv width: {width}")
+    if conv_states is None:
+        raise ValueError("causal_conv1d_fn_split_qkv requires conv_states")
+    if conv_states.shape[1] != dim or conv_states.shape[2] < width - 1:
+        raise ValueError(
+            "conv_states must have shape [cache_lines, dim, at least width - 1]"
+        )
+    if query_start_loc.numel() != len(seq_lens_cpu) + 1:
+        raise ValueError("query_start_loc must have one entry per sequence plus one")
+
+    head_q_dim = q_dim // num_q_heads if head_q_dim is None else head_q_dim
+    head_k_dim = k_dim // num_k_heads if head_k_dim is None else head_k_dim
+    head_v_dim = v_dim // num_v_heads if head_v_dim is None else head_v_dim
+    if (
+        num_q_heads * head_q_dim != q_dim
+        or num_k_heads * head_k_dim != k_dim
+        or num_v_heads * head_v_dim != v_dim
+    ):
+        raise ValueError("Q/K/V dimensions must agree with their head layouts")
+
+    q_out = torch.empty(
+        (1, cu_seqlen, num_q_heads, head_q_dim), dtype=x.dtype, device=x.device
+    )
+    k_out = torch.empty(
+        (1, cu_seqlen, num_k_heads, head_k_dim), dtype=x.dtype, device=x.device
+    )
+    v_out = torch.empty(
+        (1, cu_seqlen, num_v_heads, head_v_dim), dtype=x.dtype, device=x.device
+    )
+
+    _launch_causal_conv1d_fwd(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        seq_lens_cpu,
+        cache_indices,
+        has_initial_state,
+        pad_slot_id,
+        activation,
+        out=x,
+        q_out=q_out,
+        k_out=k_out,
+        v_out=v_out,
+        q_dim=q_dim,
+        k_dim=k_dim,
+        v_dim=v_dim,
+    )
+    return q_out, k_out, v_out
 
 
 # HAS_EAGLE_TREE_CUSTOM_ATTN_MASK is added to support eagle tree attention mask
