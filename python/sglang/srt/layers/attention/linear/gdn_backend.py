@@ -31,6 +31,17 @@ if is_cuda() or is_hip():
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
+
+def _forward_batch_has_padding(forward_batch: ForwardBatch) -> bool:
+    if int(getattr(forward_batch, "num_padding", 0) or 0) > 0:
+        return True
+    original_batch_size = getattr(forward_batch, "_original_batch_size", None)
+    return (
+        original_batch_size is not None
+        and int(original_batch_size) < forward_batch.batch_size
+    )
+
+
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
@@ -66,8 +77,20 @@ class GDNKernelDispatcher:
         triton_kernel = TritonGDNKernel()
 
         cutedsl_kernel = None
+        aiter_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_aiter():
+            if not is_hip():
+                rank0_log("AITER GDN decode requires ROCm. Falling back to Triton.")
+                self.decode_kernel = triton_kernel
+            else:
+                from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
+                    AiterGDNKernel,
+                )
+
+                aiter_kernel = AiterGDNKernel(fallback_kernel=triton_kernel)
+                self.decode_kernel = aiter_kernel
         elif decode_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("GDN CuTe DSL backend requires CUDA")
@@ -91,6 +114,18 @@ class GDNKernelDispatcher:
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
+        elif prefill_backend.is_aiter():
+            if not is_hip():
+                rank0_log("AITER GDN prefill requires ROCm. Falling back to Triton.")
+                self.extend_kernel = triton_kernel
+            else:
+                if aiter_kernel is None:
+                    from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
+                        AiterGDNKernel,
+                    )
+
+                    aiter_kernel = AiterGDNKernel(fallback_kernel=triton_kernel)
+                self.extend_kernel = aiter_kernel
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("GDN CuTe DSL backend requires CUDA")
@@ -148,6 +183,11 @@ class GDNKernelDispatcher:
             f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
+
+    def reset_decode_cache(self):
+        reset = getattr(self.decode_kernel, "reset_decode_cache", None)
+        if reset is not None:
+            reset()
 
     def packed_decode(
         self,
@@ -284,12 +324,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        self.mamba_cache_chunk_size = model_runner.server_args.mamba_cache_chunk_size
+        self._aiter_decode_active_batch_size: Optional[int] = None
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self._prepare_aiter_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -299,6 +342,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        super().init_forward_metadata_out_graph(forward_batch, in_capture)
+        self._prepare_aiter_forward_metadata(forward_batch, in_capture=in_capture)
+
+    def _prepare_aiter_forward_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        in_capture: bool = False,
+    ):
+        self._aiter_decode_active_batch_size = None
+        if forward_batch.forward_mode.is_decode_or_idle():
+            num_padding = (
+                0 if in_capture else int(getattr(forward_batch, "num_padding", 0) or 0)
+            )
+            self._aiter_decode_active_batch_size = (
+                forward_batch.batch_size - num_padding
+            )
+            self.kernel_dispatcher.reset_decode_cache()
 
     def forward_decode(
         self,
@@ -383,6 +450,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            active_batch_size=self._aiter_decode_active_batch_size,
+            replayssm_d=replayssm_d,
+            replayssm_k=replayssm_k,
+            replayssm_g=replayssm_g,
         )
 
         self._track_mamba_state_decode(
@@ -532,6 +603,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            return_intermediate_h = (
+                forward_metadata.has_mamba_track_mask
+                and forward_metadata.track_ssm_h_src.numel() > 0
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -541,6 +616,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                return_intermediate_h=return_intermediate_h,
+                has_padding=_forward_batch_has_padding(forward_batch),
+                mamba_cache_chunk_size=self.mamba_cache_chunk_size,
             )
 
             if is_npu() and last_recurrent_state is not None:
@@ -555,7 +633,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_states[cache_indices] = conv_states_contig
                 ssm_states[cache_indices] = ssm_states_contig
 
-            if h is not None:
+            if h is not None or (
+                forward_metadata.has_mamba_track_mask
+                and forward_metadata.track_ssm_final_src.numel() > 0
+            ):
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
