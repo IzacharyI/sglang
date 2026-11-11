@@ -25,6 +25,17 @@ class TestParseSpecTpSync(CustomTestCase):
         self.assertNotIn(DRAFT, parse_spec_tp_sync("rng"))
         self.assertIn(DRAFT, parse_spec_tp_sync("dspark-draft"))
 
+    def test_default_syncs_the_dflash_draft_block(self):
+        # The DFlash draft block was measured to differ across ranks; the default keeps it in sync.
+        dflash = {SpecTpSyncSite.DFLASH_DRAFT, SpecTpSyncSite.DFLASH_SIM_ACCEPT}
+        for spec in ("init", "rng", "all"):
+            with self.subTest(spec=spec):
+                self.assertTrue(dflash <= parse_spec_tp_sync(spec))
+        self.assertFalse(
+            dflash & parse_spec_tp_sync("init,-dflash-draft,-dflash-sim-accept")
+        )
+        self.assertEqual(parse_spec_tp_sync("18,19"), frozenset(dflash))
+
 
 if __name__ == "__main__":
     unittest.main()

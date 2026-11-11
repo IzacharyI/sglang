@@ -2397,6 +2397,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 next_token_logits=next_token_logits,
                 generator=self._simulated_acc_len_rng,
             )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SIM_ACCEPT, commit_lens)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SIM_ACCEPT, out_tokens)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SIM_ACCEPT, accept_len)
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
@@ -2932,6 +2935,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        # Every rank must verify (and commit) the same block; see SpecTpSyncSite.DFLASH_DRAFT.
+        self._tp_sync.sync(SpecTpSyncSite.DFLASH_DRAFT, draft_tokens)
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (

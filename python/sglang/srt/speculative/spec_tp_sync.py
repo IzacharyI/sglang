@@ -33,6 +33,10 @@ class SpecTpSyncSite(IntEnum):
     DFLASH_ACCEPT_SAMPLE = 14
     DFLASH_ACCEPT_GREEDY = 15
     DFLASH_TARGET = 16
+    # The draft block sent to the target verify, and the commit that simulated
+    # acceptance (SGLANG_SIMULATE_ACC_LEN) derives from it.
+    DFLASH_DRAFT = 18
+    DFLASH_SIM_ACCEPT = 19
 
     @property
     def slug(self) -> str:
@@ -41,6 +45,13 @@ class SpecTpSyncSite(IntEnum):
 
 _ALL = frozenset(SpecTpSyncSite)
 _INIT = frozenset({SpecTpSyncSite.DSPARK_MEM, SpecTpSyncSite.DFLASH_MEM})
+# The DFlash draft block can differ on one rank (measured on Muse Spark TP4: rank 0's
+# draft tokens differed from the other ranks' within ~1.4k verify steps). Each rank
+# then commits different tokens, its radix cache and batch composition drift apart,
+# and the next TP collective deadlocks. Broadcasting the block (and the simulated
+# acceptance commit built from it) keeps the committed tokens identical; it costs
+# one [bs, block_size] broadcast per step.
+_DRAFT = frozenset({SpecTpSyncSite.DFLASH_DRAFT, SpecTpSyncSite.DFLASH_SIM_ACCEPT})
 # Sites that draw from the RNG, so they can differ under identical logits; so did the
 # renorm output the accept sites consume, before sampling_renorm.py made it
 # bit-identical across ranks whenever tp_size > 1.
@@ -59,8 +70,8 @@ _PRESETS = {
     "off": frozenset(),
     "none": frozenset(),
     # The one input measured to differ across ranks.
-    "init": _INIT,
-    "rng": _INIT | _RNG,
+    "init": _INIT | _DRAFT,
+    "rng": _INIT | _DRAFT | _RNG,
 }
 
 _BY_SLUG = {site.slug: site for site in SpecTpSyncSite}

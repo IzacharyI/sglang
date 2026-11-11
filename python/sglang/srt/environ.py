@@ -1793,8 +1793,9 @@ class Envs:
     # Which speculative decisions rank 0 broadcasts to its TP group. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
     # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
-    # The default syncs only the startup memory probes: ranks compute every per-step
-    # decision alike. If TP ranks still diverge or hang, set "all" and report a repro.
+    # The default syncs the startup memory probes and the DFlash draft block (the one
+    # per-step input measured to differ across ranks); ranks compute every other
+    # per-step decision alike. If TP ranks still diverge or hang, set "all" and report a repro.
     SGLANG_SPEC_TP_SYNC = EnvStr("init")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
