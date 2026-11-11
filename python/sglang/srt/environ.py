@@ -2341,6 +2341,9 @@ class Envs:
     # TP4 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
     # FlyDSL finalize + aiter two-stage all-reduce).
     SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH = EnvBool(True)
+    # TP4 target verify at up to 8 requests: the whole attention block (QKV .. o_proj .. TP4 reduction .. boundary)
+    # as one persistent launch (aiter.ops.muse_attnblk_mega; needs an aiter that ships it).
+    SGLANG_ROCM_MUSE_ATTNBLK_MEGA = EnvBool(False)
     SGLANG_ROCM_MUSE_DENSE_TUNED = EnvBool(True)
     SGLANG_ROCM_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
     SGLANG_ROCM_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
