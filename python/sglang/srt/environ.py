@@ -2341,6 +2341,9 @@ class Envs:
     # TP4 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
     # FlyDSL finalize + aiter two-stage all-reduce).
     SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH = EnvBool(True)
+    # TP4 compact A4 verify at 16..64 rows: one-launch MoE front (router, pooler split over the ranks, routing,
+    # MXFP4 quant, scatter) and the unpool split over the ranks with a slab all-gather.
+    SGLANG_ROCM_MUSE_MOE_MEGA = EnvBool(False)
     SGLANG_ROCM_MUSE_DENSE_TUNED = EnvBool(True)
     SGLANG_ROCM_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
     SGLANG_ROCM_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)

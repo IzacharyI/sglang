@@ -111,6 +111,7 @@ from sglang.srt.rocm_muse_spark.sequence_parallel import (
     ulysses_prepared,
 )
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.utils.device import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -368,6 +369,7 @@ _DENSE_TILED = envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
 _DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
 # Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
 _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY.get()
+_MOE_MEGA = envs.SGLANG_ROCM_MUSE_MOE_MEGA.get()
 # Device memory left for the KV pool, CUDA graphs and activations beside both MXFP4 expert layouts; below it
 # the experts keep only the a4w4 preshuffled copy. Arbitrary, not tuned.
 _A4W4_RESERVE_BYTES = 64 << 30
@@ -1051,6 +1053,8 @@ class MuseSpark1xMoE(nn.Module):
             and self.expert_hidden_size == 4096
             else None
         )
+        # The TP4 verify mega path (moe_mega.MuseMoEMega), built in post_load_weights when enabled.
+        self._mega = None
 
     def _routing_op(self) -> FusedMuseSparkRouting:
         """The fused router: sigmoid, biased top-k, gather, renormalise, scale.
@@ -1085,6 +1089,16 @@ class MuseSpark1xMoE(nn.Module):
         reduced expert output before the unpooler (fused into the next boundary).
         ``x_fp8`` = (per-row FP8 copy, scales) of ``hidden_states`` for the FP8 pooler;
         ``prefill_fp8`` runs the pooler / unpooler on their FP8 copies (prefill widths)."""
+        if (
+            self._mega is not None
+            and target_verify
+            and sp is None
+            and x_fp8 is not None
+            and not skip_post_expert_proj
+            and not prefill_fp8
+            and self._mega.applies(hidden_states.shape[0])
+        ):
+            return self._mega(hidden_states)
         quantize_a4 = sp is None and self.uses_compact_a4(
             hidden_states.shape[0], target_verify
         )
@@ -2238,6 +2252,21 @@ class MuseSparkTextForCausalLM(nn.Module):
             ensure = getattr(op, "_ensure_cached_weights", None)
             if ensure is not None:
                 ensure(torch.bfloat16)
+        if _MOE_MEGA:
+            self._build_moe_mega(moe_layers)
+
+    def _build_moe_mega(self, moe_layers) -> None:
+        """The TP4 target-verify MoE mega path (collective over the TP CPU group; built once, outside capture)."""
+        tp = get_parallel().tp_group
+        if not (_is_rocm() and is_gfx95_supported() and tp.world_size == 4):
+            return
+        from sglang.srt.rocm_muse_spark import moe_mega
+
+        for moe in moe_layers:
+            if moe._mega is None and moe_mega.eligible(moe):
+                moe._mega = moe_mega.MuseMoEMega(
+                    moe, tp.cpu_group, _post_expert_norm_args(moe.post_expert_norm)
+                )
 
 
 __all__ = [
